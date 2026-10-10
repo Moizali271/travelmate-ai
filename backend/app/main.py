@@ -1,21 +1,17 @@
-import os
 from contextlib import asynccontextmanager
 
-from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pymongo import AsyncMongoClient
 
-load_dotenv()
-
-client = AsyncMongoClient(os.getenv("MONGODB_URI"))
-db = client[os.getenv("DB_NAME", "travelmate")]
+from app.db import client, db
+from app.routers import trips
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await client.admin.command("ping")
     print("MongoDB connected")
+    await db.trips.create_index([("createdAt", -1)])
     yield
     await client.close()
 
@@ -28,6 +24,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(trips.router)
 
 
 @app.get("/api/health")
