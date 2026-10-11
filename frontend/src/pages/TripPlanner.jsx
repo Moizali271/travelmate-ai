@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
-import api from "../services/api";
+import { authFetch } from "../services/authFetch";
+
+const API_URL = "/api/trips";
 
 const emptyForm = {
-  title: "",
+  from: "",
   destination: "",
   startDate: "",
   endDate: "",
@@ -10,79 +12,122 @@ const emptyForm = {
   travelerCount: 1,
 };
 
-const inputClass = "w-full rounded border border-gray-300 p-2";
+function friendlyError(err) {
+  if (err instanceof TypeError) {
+    return "Backend se rabta nahi ho raha. Check karein ke uvicorn chal raha hai.";
+  }
+  return err.message;
+}
 
 export default function TripPlanner() {
   const [form, setForm] = useState(emptyForm);
   const [trips, setTrips] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
 
-  const loadTrips = async () => {
+  async function loadTrips() {
+    setLoading(true);
     try {
-      const res = await api.get("/trips");
-      setTrips(res.data);
-    } catch {
-      setError("Trips nahi aa saki. Kya backend chal raha hai?");
+      const res = await authFetch(API_URL);
+      if (!res.ok) throw new Error(`Server ne ${res.status} diya`);
+      setTrips(await res.json());
+    } catch (err) {
+      setError("Trips load nahi ho saki: " + friendlyError(err));
     } finally {
       setLoading(false);
     }
-  };
+  }
 
   useEffect(() => {
     loadTrips();
   }, []);
 
-  const handleChange = (e) => {
+  function handleChange(e) {
     setForm({ ...form, [e.target.name]: e.target.value });
-  };
+  }
 
-  const handleSubmit = async (e) => {
+  async function handleSubmit(e) {
     e.preventDefault();
     setError("");
-    try {
-      await api.post("/trips", {
-        ...form,
-        budget: Number(form.budget),
-        travelerCount: Number(form.travelerCount),
-      });
-      setForm(emptyForm);
-      loadTrips();
-    } catch (err) {
-      const detail = err.response?.data?.detail;
-      setError(
-        Array.isArray(detail) ? detail[0].msg : "Trip save nahi ho saki."
-      );
-    }
-  };
+    setMessage("");
 
-  const handleDelete = async (id) => {
-    await api.delete(`/trips/${id}`);
-    loadTrips();
-  };
+    if (form.endDate < form.startDate) {
+      setError("Wapsi ki tareekh shuru ki tareekh se pehle nahi ho sakti.");
+      return;
+    }
+
+    setSaving(true);
+    try {
+      const res = await authFetch(API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: `${form.from} se ${form.destination}`,
+          destination: form.destination,
+          startDate: form.startDate,
+          endDate: form.endDate,
+          budget: Number(form.budget),
+          currency: "PKR",
+          travelerCount: Number(form.travelerCount),
+          status: "planned",
+        }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        const detail = Array.isArray(data?.detail)
+          ? data.detail.map((d) => d.msg).join(", ")
+          : data?.detail;
+        throw new Error(detail || `Server ne ${res.status} diya`);
+      }
+
+      setMessage("Trip save ho gayi!");
+      setForm(emptyForm);
+      await loadTrips();
+    } catch (err) {
+      setError("Trip save nahi ho saki: " + friendlyError(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleDelete(id) {
+    setError("");
+    try {
+      const res = await authFetch(`${API_URL}/${id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(`Server ne ${res.status} diya`);
+      await loadTrips();
+    } catch (err) {
+      setError("Trip delete nahi ho saki: " + friendlyError(err));
+    }
+  }
+
+  const inputClass = "w-full rounded border border-gray-300 p-3";
 
   return (
     <div>
-      <h1 className="text-2xl font-bold">Trip Planner</h1>
+      <h1 className="mb-4 text-3xl font-bold">Trip Planner</h1>
 
       <form
         onSubmit={handleSubmit}
-        className="mt-4 grid gap-3 rounded-lg bg-white p-4 shadow sm:grid-cols-2"
+        className="grid gap-4 rounded-lg bg-white p-6 shadow md:grid-cols-2"
       >
         <input
           className={inputClass}
-          name="title"
-          placeholder="Trip ka naam (jaise Hunza Trip)"
-          value={form.title}
+          name="from"
+          value={form.from}
           onChange={handleChange}
+          placeholder="Kahan se (jaise Karachi)"
           required
         />
         <input
           className={inputClass}
           name="destination"
-          placeholder="Destination (jaise Hunza)"
           value={form.destination}
           onChange={handleChange}
+          placeholder="Kahan tak (jaise Hunza)"
           required
         />
         <input
@@ -106,9 +151,9 @@ export default function TripPlanner() {
           type="number"
           min="0"
           name="budget"
-          placeholder="Budget (PKR)"
           value={form.budget}
           onChange={handleChange}
+          placeholder="Budget (PKR)"
           required
         />
         <input
@@ -116,47 +161,55 @@ export default function TripPlanner() {
           type="number"
           min="1"
           name="travelerCount"
-          placeholder="Kitne log"
           value={form.travelerCount}
           onChange={handleChange}
+          placeholder="Musafiron ki tadaad"
           required
         />
         <button
           type="submit"
-          className="rounded bg-blue-600 p-2 font-semibold text-white hover:bg-blue-700 sm:col-span-2"
+          disabled={saving}
+          className="rounded bg-blue-600 p-3 font-semibold text-white md:col-span-2 disabled:opacity-60"
         >
-          Trip Save Karein
+          {saving ? "Save ho rahi hai..." : "Trip Save Karein"}
         </button>
       </form>
 
-      {error && <p className="mt-3 text-red-600">{error}</p>}
+      {message && <p className="mt-4 text-green-600">{message}</p>}
+      {error && <p className="mt-4 text-red-600">{error}</p>}
 
-      <h2 className="mt-6 text-xl font-semibold">Meri Trips</h2>
-      {loading && <p className="mt-2 text-gray-500">Loading...</p>}
-      {!loading && trips.length === 0 && (
-        <p className="mt-2 text-gray-500">Abhi koi trip nahi hai.</p>
-      )}
-
-      <div className="mt-3 grid gap-3 sm:grid-cols-2">
-        {trips.map((trip) => (
-          <div key={trip.id} className="rounded-lg bg-white p-4 shadow">
-            <h3 className="text-lg font-bold">{trip.title}</h3>
-            <p className="text-gray-600">{trip.destination}</p>
-            <p className="mt-1 text-sm">
-              {trip.startDate} se {trip.endDate}
-            </p>
-            <p className="text-sm">
-              Budget: {trip.budget} {trip.currency} | Log: {trip.travelerCount}
-            </p>
-            <button
-              onClick={() => handleDelete(trip.id)}
-              className="mt-3 text-sm text-red-600 hover:underline"
+      <h2 className="mt-8 mb-3 text-2xl font-bold">Meri Trips</h2>
+      {loading ? (
+        <p className="text-gray-500">Loading...</p>
+      ) : trips.length === 0 ? (
+        <p className="text-gray-500">Abhi koi trip nahi hai.</p>
+      ) : (
+        <ul className="space-y-3">
+          {trips.map((trip) => (
+            <li
+              key={trip.id}
+              className="flex items-center justify-between rounded-lg bg-white p-4 shadow"
             >
-              Delete
-            </button>
-          </div>
-        ))}
-      </div>
+              <div>
+                <p className="text-lg font-semibold">{trip.title}</p>
+                <p className="text-gray-600">
+                  {trip.destination} | {trip.startDate} se {trip.endDate}
+                </p>
+                <p className="text-gray-600">
+                  Budget: {Number(trip.budget).toLocaleString()} {trip.currency} |{" "}
+                  {trip.travelerCount} musafir | {trip.status}
+                </p>
+              </div>
+              <button
+                onClick={() => handleDelete(trip.id)}
+                className="rounded bg-red-500 px-3 py-2 text-white"
+              >
+                Delete
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
