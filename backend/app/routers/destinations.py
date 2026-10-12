@@ -1,19 +1,18 @@
 import asyncio
 import os
 import time
+from pathlib import Path
 
 import httpx
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.auth import get_current_user
 
-load_dotenv()
-
 router = APIRouter(prefix="/api/destinations", tags=["destinations"])
 
-PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+# backend/app/routers/destinations.py -> backend/.env
+ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
 
 HEADERS = {"User-Agent": "TravelMateAI/1.0 (student portfolio project)"}
 TIMEOUT = httpx.Timeout(10.0)
@@ -32,6 +31,12 @@ CACHE_SECONDS = 600
 _cache: dict = {}
 
 
+def get_secret(name: str) -> str:
+    # .env har dafa file se padhi jati hai, isliye key badalne par restart nahi chahiye
+    value = dotenv_values(ENV_PATH).get(name) or os.getenv(name) or ""
+    return value.strip().strip('"').strip("'")
+
+
 def cache_get(key: str):
     item = _cache.get(key)
     if item and time.time() - item[0] < CACHE_SECONDS:
@@ -41,6 +46,10 @@ def cache_get(key: str):
 
 def cache_set(key: str, value) -> None:
     _cache[key] = (time.time(), value)
+
+
+def normalize(text: str) -> str:
+    return " ".join(text.lower().split())
 
 
 async def nominatim_search(client: httpx.AsyncClient, term: str, limit: int = 8):
@@ -66,7 +75,7 @@ async def wiki_lookup(client: httpx.AsyncClient, term: str, name: str) -> dict:
                 "action": "query",
                 "generator": "search",
                 "gsrsearch": term,
-                "gsrlimit": 1,
+                "gsrlimit": 5,
                 "prop": "extracts|pageimages|info",
                 "exintro": 1,
                 "explaintext": 1,
@@ -78,18 +87,18 @@ async def wiki_lookup(client: httpx.AsyncClient, term: str, name: str) -> dict:
         )
         res.raise_for_status()
         pages = (res.json().get("query") or {}).get("pages") or {}
-        page = next(iter(pages.values()), None)
-        if not page:
-            return {}
-        title = (page.get("title") or "").lower()
-        wanted = name.lower()
-        if wanted not in title and title not in wanted:
-            return {}
-        return {
-            "description": (page.get("extract") or "").strip(),
-            "photo": (page.get("thumbnail") or {}).get("source"),
-            "wiki_url": page.get("fullurl"),
-        }
+        ranked = sorted(pages.values(), key=lambda p: p.get("index", 99))
+        wanted = normalize(name)
+        for page in ranked:
+            title = normalize(page.get("title") or "")
+            # sirf wohi page jis ka title naam se bilkul milta ho
+            if title == wanted or title.startswith(wanted + " ("):
+                return {
+                    "description": (page.get("extract") or "").strip(),
+                    "photo": (page.get("thumbnail") or {}).get("source"),
+                    "wiki_url": page.get("fullurl"),
+                }
+        return {}
     except (httpx.HTTPError, ValueError):
         return {}
 
@@ -109,13 +118,14 @@ async def wiki_info(client: httpx.AsyncClient, name: str, hint: str) -> dict:
 
 
 async def pexels_photo(client: httpx.AsyncClient, query: str):
-    if not PEXELS_API_KEY:
+    api_key = get_secret("PEXELS_API_KEY")
+    if not api_key:
         return None
     try:
         res = await client.get(
             "https://api.pexels.com/v1/search",
             params={"query": query, "per_page": 1},
-            headers={"Authorization": PEXELS_API_KEY},
+            headers={"Authorization": api_key},
         )
         res.raise_for_status()
         photos = res.json().get("photos") or []
@@ -148,6 +158,25 @@ async def build_item(client: httpx.AsyncClient, raw: dict) -> dict:
         "photo_url": photo,
         "wiki_url": info.get("wiki_url"),
     }
+
+
+def youtube_error_message(res: httpx.Response) -> str:
+    try:
+        err = res.json().get("error") or {}
+    except ValueError:
+        err = {}
+    message = err.get("message", "")
+    reasons = " ".join(e.get("reason", "") for e in err.get("errors", []))
+
+    if "quota" in reasons.lower() or "quota" in message.lower():
+        return "YouTube ki roz ki hadd khatam ho gayi, kal dobara try karein"
+    if "API key not valid" in message:
+        return "YouTube API key ghalat hai, nayi key dobara copy karke .env mein lagayein"
+    if "has not been used" in message or "disabled" in message or "accessNotConfigured" in reasons:
+        return "YouTube Data API v3 enable nahi hai, Google Cloud Library mein Enable karein"
+    if "blocked" in message.lower() or "referer" in message.lower():
+        return "Is key par restriction hai, API restrictions mein YouTube Data API v3 chunein"
+    return f"YouTube ne {res.status_code} diya"
 
 
 @router.get("/search")
@@ -189,8 +218,12 @@ async def destination_videos(
     q: str = Query(min_length=2, max_length=80),
     user: dict = Depends(get_current_user),
 ):
-    if not YOUTUBE_API_KEY:
-        return {"videos": [], "message": "YouTube key set nahi hai"}
+    api_key = get_secret("YOUTUBE_API_KEY")
+    if not api_key:
+        return {
+            "videos": [],
+            "message": "YOUTUBE_API_KEY backend/.env mein nahi mili. Naam, nayi line aur save check karein",
+        }
 
     key = f"videos:{q.lower()}"
     cached = cache_get(key)
@@ -207,13 +240,19 @@ async def destination_videos(
                     "type": "video",
                     "maxResults": 6,
                     "safeSearch": "moderate",
-                    "key": YOUTUBE_API_KEY,
+                    "key": api_key,
                 },
             )
-            res.raise_for_status()
-            data = res.json()
-    except (httpx.HTTPError, ValueError):
-        return {"videos": [], "message": "YouTube se videos nahi mil sake"}
+    except httpx.HTTPError:
+        return {"videos": [], "message": "YouTube se rabta nahi ho saka, internet check karein"}
+
+    if res.status_code != 200:
+        return {"videos": [], "message": youtube_error_message(res)}
+
+    try:
+        data = res.json()
+    except ValueError:
+        return {"videos": [], "message": "YouTube ka jawab samajh nahi aaya"}
 
     videos = []
     for item in data.get("items", []):
@@ -234,5 +273,6 @@ async def destination_videos(
         )
 
     result = {"videos": videos, "message": "" if videos else "Koi video nahi mili"}
-    cache_set(key, result)
+    if videos:
+        cache_set(key, result)
     return result
