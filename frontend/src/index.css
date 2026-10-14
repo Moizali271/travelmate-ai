@@ -1,1 +1,56 @@
+
 @import "tailwindcss";
+
+:root {
+  --maroon: #3B0718;
+  --maroon-dark: #24040E;
+  --gold: #D4AF37;
+  --gold-light: #F7EAC0;
+  --white: #FFFFFF;
+  --text-dark: #292126;
+  --text-muted: #746B70;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  background-color: var(--white);
+  color: var(--text-dark);
+  font-family: Arial, sans-serif;
+}
+
+::selection {
+  background-color: var(--gold);
+  color: var(--maroon-dark);
+}
+
+button,
+a {
+  transition: all 0.2s ease;
+}
+
+button:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--gold);
+  outline-offset: 3px;
+}
+
+/* Leaflet map layering fix */
+.leaflet-pane,
+.leaflet-control {
+  z-index: 1 !important;
+}
+
+.leaflet-top,
+.leaflet-bottom {
+  z-index: 2 !important;
+}
+
+/* Keep Navbar above the map */
+nav {
+  position: relative;
+  z-index: 1000;
+}
