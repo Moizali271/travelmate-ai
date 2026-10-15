@@ -20,6 +20,22 @@ const TYPE_LABELS = {
   apartment: "Apartment",
 };
 
+const TYPE_ICONS = {
+  hotel: "🏨",
+  guest_house: "🏡",
+  hostel: "🛏️",
+  motel: "🚗",
+  apartment: "🏢",
+};
+
+const AMENITY_LABELS = {
+  wifi: "📶 WiFi",
+  pool: "🏊 Pool",
+  ac: "❄️ AC",
+  parking: "🅿️ Parking",
+  wheelchair: "♿ Accessible",
+};
+
 const TYPE_FILTERS = [
   { label: "All types", value: "all" },
   { label: "Hotels", value: "hotel" },
@@ -34,6 +50,15 @@ const STAR_FILTERS = [
   { label: "3+ stars", value: "3" },
   { label: "4+ stars", value: "4" },
   { label: "5 stars", value: "5" },
+];
+
+const AMENITY_FILTERS = [
+  { label: "Any amenities", value: "all" },
+  { label: "WiFi", value: "wifi" },
+  { label: "Pool", value: "pool" },
+  { label: "AC", value: "ac" },
+  { label: "Parking", value: "parking" },
+  { label: "Accessible", value: "wheelchair" },
 ];
 
 const SORTS = [
@@ -107,6 +132,36 @@ function FocusHotel({ hotel }) {
   return null;
 }
 
+function HotelPhoto({ hotel }) {
+  const [failed, setFailed] = useState(false);
+  const showImage = hotel.image && !failed;
+
+  return (
+    <div className="relative h-40 w-full overflow-hidden rounded-xl bg-gradient-to-br from-[#3B0718] via-[#701C35] to-[#D4AF37]">
+      {showImage ? (
+        <img
+          src={hotel.image}
+          alt={hotel.name}
+          loading="lazy"
+          referrerPolicy="no-referrer"
+          onError={() => setFailed(true)}
+          className="h-full w-full object-cover"
+        />
+      ) : (
+        <div className="flex h-full w-full items-center justify-center text-5xl opacity-80">
+          {TYPE_ICONS[hotel.type] || "🏨"}
+        </div>
+      )}
+
+      {showImage && hotel.imageSource === "stock" && (
+        <span className="absolute bottom-1 right-1 rounded bg-black/50 px-1.5 py-0.5 text-[10px] text-white">
+          Stock photo · Pexels
+        </span>
+      )}
+    </div>
+  );
+}
+
 export default function Hotels() {
   const navigate = useNavigate();
   const today = todayString();
@@ -118,16 +173,15 @@ export default function Hotels() {
   const [searched, setSearched] = useState(false);
   const [error, setError] = useState("");
 
-  // Hotel results state
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [hotelError, setHotelError] = useState("");
   const [typeFilter, setTypeFilter] = useState("all");
   const [minStars, setMinStars] = useState("0");
+  const [amenityFilter, setAmenityFilter] = useState("all");
   const [sort, setSort] = useState("distance");
   const [focused, setFocused] = useState(null);
 
-  // Reserve Stay state
   const [trips, setTrips] = useState([]);
   const [reserveHotel, setReserveHotel] = useState(null);
   const [guestName, setGuestName] = useState("");
@@ -141,7 +195,6 @@ export default function Hotels() {
   const [reserveError, setReserveError] = useState("");
   const [booking, setBooking] = useState(null);
 
-  // Page khulte hi trips load karo (booking ko trip se jodne ke liye)
   useEffect(() => {
     async function loadTrips() {
       try {
@@ -158,7 +211,6 @@ export default function Hotels() {
     loadTrips();
   }, []);
 
-  // Escape dabane par popup band
   useEffect(() => {
     if (!reserveHotel) return undefined;
 
@@ -341,6 +393,12 @@ export default function Hotels() {
       if (Number(minStars) > 0 && (h.stars || 0) < Number(minStars)) {
         return false;
       }
+      if (
+        amenityFilter !== "all" &&
+        !(h.amenities || []).includes(amenityFilter)
+      ) {
+        return false;
+      }
       return true;
     });
 
@@ -356,7 +414,14 @@ export default function Hotels() {
       list.sort((a, b) => a.distanceKm - b.distanceKm);
     }
     return list;
-  }, [result, typeFilter, minStars, sort]);
+  }, [result, typeFilter, minStars, amenityFilter, sort]);
+
+  const hasStockPhotos = useMemo(
+    () =>
+      !!result &&
+      result.hotels.some((h) => h.imageSource === "stock" && h.image),
+    [result]
+  );
 
   const bookingUrl = `https://www.booking.com/searchresults.html?ss=${encodeURIComponent(
     destination.trim()
@@ -542,7 +607,7 @@ export default function Hotels() {
 
           {result && result.hotels.length > 0 && (
             <>
-              <div className="grid gap-3 sm:grid-cols-3">
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                 <select
                   value={typeFilter}
                   onChange={(e) => setTypeFilter(e.target.value)}
@@ -561,6 +626,18 @@ export default function Hotels() {
                   className={selectSmallClass}
                 >
                   {STAR_FILTERS.map((item) => (
+                    <option key={item.value} value={item.value}>
+                      {item.label}
+                    </option>
+                  ))}
+                </select>
+
+                <select
+                  value={amenityFilter}
+                  onChange={(e) => setAmenityFilter(e.target.value)}
+                  className={selectSmallClass}
+                >
+                  {AMENITY_FILTERS.map((item) => (
                     <option key={item.value} value={item.value}>
                       {item.label}
                     </option>
@@ -639,7 +716,9 @@ export default function Hotels() {
                     key={hotel.id}
                     className="flex flex-col rounded-2xl border border-gray-200 bg-white p-4 shadow-sm"
                   >
-                    <div className="flex items-start justify-between gap-2">
+                    <HotelPhoto hotel={hotel} />
+
+                    <div className="mt-3 flex items-start justify-between gap-2">
                       <span className="rounded-full border border-[#D4AF37] bg-[#F7EAC0] px-3 py-1 text-xs font-bold text-[#3B0718]">
                         {TYPE_LABELS[hotel.type] || hotel.type}
                       </span>
@@ -672,6 +751,23 @@ export default function Hotels() {
                     {hotel.phone && (
                       <p className="mt-1 text-sm text-gray-600">
                         📞 {hotel.phone}
+                      </p>
+                    )}
+
+                    {hotel.amenities && hotel.amenities.length > 0 ? (
+                      <div className="mt-3 flex flex-wrap gap-1.5">
+                        {hotel.amenities.map((a) => (
+                          <span
+                            key={a}
+                            className="rounded-full bg-[#FFFDF8] px-2.5 py-1 text-xs font-semibold text-[#3B0718] ring-1 ring-[#D4AF37]/50"
+                          >
+                            {AMENITY_LABELS[a] || a}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="mt-3 text-xs text-gray-400">
+                        Amenities: data available nahi
                       </p>
                     )}
 
@@ -733,6 +829,22 @@ export default function Hotels() {
                   </div>
                 ))}
               </div>
+
+              {hasStockPhotos && (
+                <p className="mt-4 text-xs text-gray-500">
+                  "Stock photo" wali tasveerein illustration ke liye hain,
+                  asal hotel ki nahi. Photos provided by{" "}
+                  <a
+                    href="https://www.pexels.com"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline"
+                  >
+                    Pexels
+                  </a>
+                  .
+                </p>
+              )}
             </>
           )}
 
@@ -793,7 +905,7 @@ export default function Hotels() {
 
           <p className="mt-4 text-sm text-gray-500">
             Note: Hotels ki list OpenStreetMap se aati hai, isliye kuch
-            hotels ya stars missing ho sakte hain. Live prices,
+            hotels, stars ya amenities missing ho sakte hain. Live prices,
             availability, taxes aur ratings booking websites par check
             karein.
           </p>

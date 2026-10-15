@@ -1,3 +1,4 @@
+
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -5,7 +6,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pymongo.errors import OperationFailure
 
 from app.db import client, db
-from app.routers import auth, bookings, destinations, hotels, routes, trips
+from app.routers import (
+    auth,
+    bookings,
+    destinations,
+    expenses,
+    hotels,
+    routes,
+    trips,
+)
 
 
 @asynccontextmanager
@@ -23,7 +32,6 @@ async def lifespan(app: FastAPI):
         [("userId", 1), ("createdAt", -1)]
     )
 
-    # OAuth index
     try:
         await db.users.drop_index(
             "oauthProvider_1_oauthSubject_1"
@@ -39,7 +47,6 @@ async def lifespan(app: FastAPI):
         },
     )
 
-    # Email index
     await db.users.create_index(
         "email",
         unique=True,
@@ -57,7 +64,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -75,6 +81,7 @@ app.include_router(destinations.router)
 app.include_router(routes.router)
 app.include_router(hotels.router)
 app.include_router(bookings.router)
+app.include_router(expenses.router)
 
 
 @app.get("/api/health")

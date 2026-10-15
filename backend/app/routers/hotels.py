@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import logging
 import math
+import os
 import re
 import time
 from datetime import date
@@ -11,11 +13,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.auth import get_current_user
 
+try:  # .env se PEXELS_API_KEY padhne ke liye (agar python-dotenv installed ho)
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
 router = APIRouter(prefix="/api/hotels", tags=["hotels"])
 logger = logging.getLogger("uvicorn.error")
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-# Pehla server na chale to doosra try hoga
 OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
@@ -25,8 +33,19 @@ CACHE_SECONDS = 600
 MAX_RESULTS = 60
 ROUNDS = 2
 
-# (lat, lon, radius) -> (time, elements), taake Overpass par bar bar request na jaye
+# Pexels (optional): .env mein PEXELS_API_KEY=xxxx likhein
+PEXELS_URL = "https://api.pexels.com/v1/search"
+PHOTO_CACHE_SECONDS = 86400
+PHOTO_QUERIES = {
+    "hotel": "hotel room interior",
+    "guest_house": "cozy guest house bedroom",
+    "hostel": "hostel dorm room",
+    "motel": "motel room",
+    "apartment": "modern apartment bedroom",
+}
+
 _cache: dict = {}
+_photo_cache: dict = {}
 
 
 def haversine_km(lat1, lon1, lat2, lon2) -> float:
@@ -51,6 +70,35 @@ def parse_stars(value):
 def build_address(tags: dict) -> str:
     keys = ("addr:housenumber", "addr:street", "addr:suburb", "addr:city")
     return ", ".join(tags[k] for k in keys if tags.get(k))
+
+
+def parse_amenities(tags: dict) -> list:
+    amenities = []
+
+    internet = str(tags.get("internet_access", "")).lower()
+    if internet in ("wlan", "wifi", "yes", "wired") or tags.get("wifi") == "yes":
+        amenities.append("wifi")
+
+    if tags.get("swimming_pool") == "yes" or tags.get("pool") == "yes":
+        amenities.append("pool")
+
+    if tags.get("air_conditioning") == "yes":
+        amenities.append("ac")
+
+    if tags.get("parking") or tags.get("parking:fee") or tags.get("capacity:parking"):
+        amenities.append("parking")
+
+    if tags.get("wheelchair") in ("yes", "limited"):
+        amenities.append("wheelchair")
+
+    return amenities
+
+
+def valid_image(url) -> str:
+    if not url:
+        return ""
+    url = str(url).strip()
+    return url if url.startswith(("http://", "https://")) else ""
 
 
 def overpass_query(lat: float, lon: float, radius: int) -> str:
@@ -92,7 +140,6 @@ async def geocode(client: httpx.AsyncClient, text: str) -> dict:
         raise HTTPException(status_code=404, detail="Destination nahi mila")
     item = data[0]
     return {
-        # User ne jo likha wahi naam rakhte hain (jaise "Karachi"), "Division" jaise suffix se bachne ke liye
         "name": text.strip().title(),
         "lat": float(item["lat"]),
         "lon": float(item["lon"]),
@@ -134,7 +181,6 @@ async def fetch_elements(client: httpx.AsyncClient, lat: float, lon: float, radi
                 logger.warning("Overpass %s returned non-JSON", url)
                 continue
 
-            # Kabhi kabhi Overpass 200 deta hai magar query fail hoti hai
             remark = str(data.get("remark", ""))
             if not data.get("elements") and "error" in remark.lower():
                 logger.warning("Overpass %s remark: %s", url, remark[:200])
@@ -151,6 +197,45 @@ async def fetch_elements(client: httpx.AsyncClient, lat: float, lon: float, radi
         status_code=502,
         detail="Hotel data service abhi busy hai, thori der baad try karo",
     )
+
+
+async def fetch_stock_photos(client: httpx.AsyncClient, kind: str) -> list:
+    api_key = os.getenv("PEXELS_API_KEY", "").strip()
+    if not api_key:
+        return []
+
+    cached = _photo_cache.get(kind)
+    if cached and time.time() - cached[0] < PHOTO_CACHE_SECONDS:
+        return cached[1]
+
+    query = PHOTO_QUERIES.get(kind, "hotel room interior")
+    try:
+        res = await client.get(
+            PEXELS_URL,
+            params={"query": query, "per_page": 15, "orientation": "landscape"},
+            headers={"Authorization": api_key, "User-Agent": USER_AGENT},
+        )
+        if res.status_code != 200:
+            logger.warning("Pexels status %s", res.status_code)
+            return []
+        photos = [
+            {"url": p["src"]["medium"]}
+            for p in res.json().get("photos", [])
+            if p.get("src", {}).get("medium")
+        ]
+    except (httpx.HTTPError, ValueError, KeyError) as err:
+        logger.warning("Pexels failed: %s", repr(err))
+        return []
+
+    _photo_cache[kind] = (time.time(), photos)
+    return photos
+
+
+def pick_photo(photos: list, hotel_id: str):
+    if not photos:
+        return None
+    index = int(hashlib.md5(hotel_id.encode()).hexdigest(), 16) % len(photos)
+    return photos[index]
 
 
 @router.get("/search")
@@ -186,6 +271,7 @@ async def search_hotels(
         if not name or lat is None or lon is None:
             continue
 
+        own_image = valid_image(tags.get("image"))
         hotels.append(
             {
                 "id": f"{el.get('type')}/{el.get('id')}",
@@ -198,18 +284,41 @@ async def search_hotels(
                 "address": build_address(tags),
                 "phone": tags.get("phone") or tags.get("contact:phone") or "",
                 "website": tags.get("website") or tags.get("contact:website") or "",
+                "amenities": parse_amenities(tags),
+                "image": own_image,
+                "imageSource": "osm" if own_image else "",
                 "bookingUrl": booking_link(name, place["name"], checkIn, checkOut, guests),
                 "mapsUrl": maps_link(name, place["name"]),
             }
         )
 
     hotels.sort(key=lambda h: h["distanceKm"])
+    hotels = hotels[:MAX_RESULTS]
+
+    # Jin hotels ki apni photo nahi, unke liye Pexels stock photo (agar key ho)
+    kinds = list({h["type"] for h in hotels if not h["image"]})
+    if kinds and os.getenv("PEXELS_API_KEY", "").strip():
+        try:
+            async with httpx.AsyncClient(timeout=10) as photo_client:
+                lists = await asyncio.gather(
+                    *[fetch_stock_photos(photo_client, k) for k in kinds]
+                )
+            photos_by_kind = dict(zip(kinds, lists))
+            for hotel in hotels:
+                if hotel["image"]:
+                    continue
+                photo = pick_photo(photos_by_kind.get(hotel["type"], []), hotel["id"])
+                if photo:
+                    hotel["image"] = photo["url"]
+                    hotel["imageSource"] = "stock"
+        except Exception as err:
+            logger.warning("Photo step failed: %s", repr(err))
 
     return {
         "destination": place,
         "checkIn": str(checkIn),
         "checkOut": str(checkOut),
         "guests": guests,
-        "count": len(hotels[:MAX_RESULTS]),
-        "hotels": hotels[:MAX_RESULTS],
+        "count": len(hotels),
+        "hotels": hotels,
     }
