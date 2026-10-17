@@ -1,229 +1,302 @@
-from datetime import datetime, timezone
-from typing import Any
-from uuid import uuid4
+from datetime import date, datetime, timezone
+from typing import Literal, Optional
 
+from bson import ObjectId
+from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from pymongo.errors import DuplicateKeyError
 
 from app.auth import get_current_user
 from app.db import db
 
-router = APIRouter(tags=["Expenses"])
+router = APIRouter(prefix="/api/expenses", tags=["expenses"])
 
-expenses_collection = db["expenses"]
-budgets_collection = db["expense_budgets"]
+Category = Literal[
+    "accommodation", "food", "transport", "activities", "shopping", "other"
+]
+GENERAL = "general"
+DEFAULT_CURRENCY = "PKR"
 
 
 class ExpenseCreate(BaseModel):
-    tripId: str | None = None
-    category: str = Field(min_length=1)
-    amount: float = Field(gt=0)
-    description: str = ""
-    expenseDate: str
+    tripId: Optional[str] = Field(default=None, max_length=50)  # None = General
+    title: str = Field(min_length=1, max_length=100)
+    category: Category = "other"
+    amount: float = Field(gt=0, le=1_000_000_000)
+    expenseDate: date
+    notes: str = Field(default="", max_length=300)
+
+    @field_validator("title", "notes")
+    @classmethod
+    def strip_text(cls, value):
+        return value.strip()
 
 
-class BudgetCreate(BaseModel):
-    budget: float = Field(ge=0)
-    currency: str = "PKR"
+class ExpenseUpdate(BaseModel):
+    title: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    category: Optional[Category] = None
+    amount: Optional[float] = Field(default=None, gt=0, le=1_000_000_000)
+    expenseDate: Optional[date] = None
+    notes: Optional[str] = Field(default=None, max_length=300)
 
 
-def get_user_id(user: Any) -> str:
-    if isinstance(user, dict):
-        value = user.get("_id") or user.get("id") or user.get("userId")
-    else:
-        value = (
-            getattr(user, "id", None)
-            or getattr(user, "_id", None)
-            or getattr(user, "userId", None)
-        )
+class BudgetSet(BaseModel):
+    amount: float = Field(ge=0, le=1_000_000_000)
+    currency: str = Field(default=DEFAULT_CURRENCY, min_length=3, max_length=10)
 
-    if value is None:
-        raise HTTPException(status_code=401, detail="Invalid user session")
-
-    return str(value)
+    @field_validator("currency")
+    @classmethod
+    def upper_currency(cls, value):
+        return value.strip().upper()
 
 
-def trip_filter(user_id: str, trip_id: str | None):
-    return {"userId": user_id, "tripId": trip_id or None}
+def serialize(doc: dict) -> dict:
+    doc["id"] = str(doc.pop("_id"))
+    return doc
 
 
-def serialize(document):
-    document.pop("_id", None)
-    return document
+def to_object_id(value: str, label: str) -> ObjectId:
+    try:
+        return ObjectId(value)
+    except InvalidId:
+        raise HTTPException(status_code=400, detail=f"Invalid {label}")
 
 
-@router.get("/api/expenses")
-async def get_expenses(
-    tripId: str | None = None,
-    user: dict = Depends(get_current_user),
-):
-    user_id = get_user_id(user)
-    cursor = expenses_collection.find(trip_filter(user_id, tripId)).sort(
-        [("expenseDate", -1), ("createdAt", -1)]
+async def get_own_trip(trip_id: str, user: dict) -> dict:
+    trip = await db.trips.find_one(
+        {"_id": to_object_id(trip_id, "trip id"), "userId": user["id"]}
     )
-    results = []
-
-    async for item in cursor:
-        results.append(serialize(item))
-
-    return results
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+    return trip
 
 
-@router.post("/api/expenses")
-async def create_expense(
-    expense: ExpenseCreate,
-    user: dict = Depends(get_current_user),
-):
-    user_id = get_user_id(user)
-
-    budget_doc = await budgets_collection.find_one(
-        trip_filter(user_id, expense.tripId)
-    )
-    currency = budget_doc.get("currency", "PKR") if budget_doc else "PKR"
-
-    item = expense.model_dump()
-    item["id"] = str(uuid4())
-    item["userId"] = user_id
-    item["currency"] = currency
-    item["createdAt"] = datetime.now(timezone.utc).isoformat()
-
-    await expenses_collection.insert_one(item)
-    return serialize(item)
-
-
-@router.put("/api/expenses/{expense_id}")
-async def update_expense(
-    expense_id: str,
-    expense: ExpenseCreate,
-    user: dict = Depends(get_current_user),
-):
-    user_id = get_user_id(user)
-    existing = await expenses_collection.find_one(
-        {"id": expense_id, "userId": user_id}
-    )
-
-    if not existing:
-        raise HTTPException(status_code=404, detail="Expense not found")
-
-    item = expense.model_dump()
-    item["id"] = expense_id
-    item["userId"] = user_id
-    item["currency"] = existing.get("currency", "PKR")
-    item["createdAt"] = existing.get(
-        "createdAt", datetime.now(timezone.utc).isoformat()
-    )
-
-    await expenses_collection.replace_one(
-        {"id": expense_id, "userId": user_id}, item
-    )
-    return item
-
-
-@router.delete("/api/expenses/{expense_id}")
-async def delete_expense(
-    expense_id: str,
-    user: dict = Depends(get_current_user),
-):
-    user_id = get_user_id(user)
-    result = await expenses_collection.delete_one(
-        {"id": expense_id, "userId": user_id}
-    )
-
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Expense not found")
-
-    return {"message": "Expense deleted"}
-
-
-@router.get("/api/expenses/budget")
-async def get_budget(
-    tripId: str | None = None,
-    user: dict = Depends(get_current_user),
-):
-    user_id = get_user_id(user)
-    budget = await budgets_collection.find_one(trip_filter(user_id, tripId))
-
-    if not budget:
-        return {
-            "tripId": tripId,
-            "budget": 0,
-            "currency": "PKR",
+async def resolve_scope(trip_id: Optional[str], user: dict):
+    """(tripId ya None, budget info). General ka budget budgets collection se,
+    trip ka budget seedha trip se (Trip Planner wala)."""
+    if not trip_id or trip_id == GENERAL:
+        doc = await db.budgets.find_one({"userId": user["id"], "scope": GENERAL})
+        info = {
+            "scope": "general",
+            "title": "General (no trip)",
+            "budget": float(doc["amount"]) if doc else 0.0,
+            "currency": doc["currency"] if doc else DEFAULT_CURRENCY,
         }
+        return None, info
 
-    budget.pop("_id", None)
-    return budget
-
-
-@router.post("/api/expenses/set-budget")
-async def save_budget(
-    budget: BudgetCreate,
-    tripId: str | None = None,
-    user: dict = Depends(get_current_user),
-):
-    user_id = get_user_id(user)
-
-    data = {
-        "userId": user_id,
-        "tripId": tripId or None,
-        "budget": budget.budget,
-        "currency": budget.currency,
+    trip = await get_own_trip(trip_id, user)
+    info = {
+        "scope": "trip",
+        "title": trip.get("title", ""),
+        "budget": float(trip.get("budget") or 0),
+        "currency": trip.get("currency", DEFAULT_CURRENCY),
     }
-
-    await budgets_collection.update_one(
-        trip_filter(user_id, tripId),
-        {"$set": data},
-        upsert=True,
-    )
-
-    return data
+    return trip_id, info
 
 
-@router.get("/api/expenses/summary")
-async def get_expense_summary(
-    tripId: str | None = None,
-    user: dict = Depends(get_current_user),
+async def run_aggregate(pipeline: list) -> list:
+    # Async pymongo mein aggregate() pehle await hota hai, phir cursor milta hai
+    cursor = await db.expenses.aggregate(pipeline)
+    return [row async for row in cursor]
+
+
+@router.post("", status_code=201)
+async def create_expense(
+    expense: ExpenseCreate, user: dict = Depends(get_current_user)
 ):
-    user_id = get_user_id(user)
-    query = trip_filter(user_id, tripId)
-    cursor = expenses_collection.find(query)
+    trip_id, _ = await resolve_scope(expense.tripId, user)
+
+    data = expense.model_dump(mode="json")
+    now = datetime.now(timezone.utc)
+    data.update(
+        {
+            "tripId": trip_id,
+            "userId": user["id"],
+            "bookingId": None,
+            "createdAt": now,
+            "updatedAt": now,
+        }
+    )
+    result = await db.expenses.insert_one(data)
+    created = await db.expenses.find_one({"_id": result.inserted_id})
+    return serialize(created)
+
+
+@router.get("")
+async def list_expenses(
+    tripId: Optional[str] = None, user: dict = Depends(get_current_user)
+):
+    query: dict = {"userId": user["id"]}
+    if tripId == GENERAL:
+        query["tripId"] = None
+    elif tripId:
+        query["tripId"] = tripId
 
     expenses = []
-    async for item in cursor:
-        expenses.append(item)
+    async for doc in db.expenses.find(query).sort(
+        [("expenseDate", -1), ("createdAt", -1)]
+    ):
+        expenses.append(serialize(doc))
+    return expenses
 
-    total_spent = sum(float(item.get("amount", 0)) for item in expenses)
 
-    budget_doc = await budgets_collection.find_one(query)
-    budget = float(budget_doc.get("budget", 0)) if budget_doc else 0
-    currency = budget_doc.get("currency", "PKR") if budget_doc else "PKR"
+@router.get("/summary")
+async def expense_summary(
+    tripId: str = GENERAL, user: dict = Depends(get_current_user)
+):
+    trip_id, info = await resolve_scope(tripId, user)
+    match = {"userId": user["id"], "tripId": trip_id}
 
-    category_totals = {}
-    day_totals = {}
+    category_rows = await run_aggregate(
+        [
+            {"$match": match},
+            {
+                "$group": {
+                    "_id": "$category",
+                    "total": {"$sum": "$amount"},
+                    "count": {"$sum": 1},
+                }
+            },
+            {"$sort": {"total": -1}},
+        ]
+    )
+    by_category = [
+        {
+            "category": row["_id"],
+            "total": round(row["total"], 2),
+            "count": row["count"],
+        }
+        for row in category_rows
+    ]
 
-    for item in expenses:
-        category = item.get("category", "other")
-        amount = float(item.get("amount", 0))
-        category_totals[category] = category_totals.get(category, 0) + amount
+    day_rows = await run_aggregate(
+        [
+            {"$match": match},
+            {"$group": {"_id": "$expenseDate", "total": {"$sum": "$amount"}}},
+            {"$sort": {"_id": 1}},
+        ]
+    )
+    by_day = [
+        {"date": row["_id"], "total": round(row["total"], 2)}
+        for row in day_rows
+    ]
 
-        day = item.get("expenseDate", "")
-        day_totals[day] = day_totals.get(day, 0) + amount
-
-    remaining = budget - total_spent
-    percent_used = round(total_spent / budget * 100, 2) if budget else 0
+    total = round(sum(item["total"] for item in by_category), 2)
+    count = sum(item["count"] for item in by_category)
+    budget = info["budget"]
 
     return {
-        "tripId": tripId,
+        "scope": info["scope"],
+        "tripId": trip_id,
+        "title": info["title"],
+        "currency": info["currency"],
         "budget": budget,
-        "totalSpent": total_spent,
-        "remaining": remaining,
-        "percentUsed": percent_used,
-        "currency": currency,
-        "byCategory": [
-            {"category": key, "total": value}
-            for key, value in category_totals.items()
-        ],
-        "byDay": [
-            {"date": key, "total": value}
-            for key, value in sorted(day_totals.items())
-        ],
+        "totalSpent": total,
+        "remaining": round(budget - total, 2),
+        "overBudget": budget > 0 and total > budget,
+        "percentUsed": round(total / budget * 100, 1) if budget > 0 else None,
+        "expenseCount": count,
+        "byCategory": by_category,
+        "byDay": by_day,
     }
+
+
+@router.put("/budget/general")
+async def set_general_budget(
+    body: BudgetSet, user: dict = Depends(get_current_user)
+):
+    await db.budgets.update_one(
+        {"userId": user["id"], "scope": GENERAL},
+        {
+            "$set": {
+                "amount": body.amount,
+                "currency": body.currency,
+                "updatedAt": datetime.now(timezone.utc),
+            }
+        },
+        upsert=True,
+    )
+    return {"scope": GENERAL, "amount": body.amount, "currency": body.currency}
+
+
+@router.post("/from-booking/{booking_id}", status_code=201)
+async def expense_from_booking(
+    booking_id: str, user: dict = Depends(get_current_user)
+):
+    booking = await db.bookings.find_one(
+        {"_id": to_object_id(booking_id, "booking id"), "userId": user["id"]}
+    )
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    if booking.get("status") == "cancelled":
+        raise HTTPException(status_code=409, detail="Cancelled booking ka kharcha add nahi hota")
+    if not booking.get("tripId"):
+        raise HTTPException(status_code=400, detail="Is booking ko pehle kisi trip se jodein")
+    if booking.get("totalPrice") is None:
+        raise HTTPException(status_code=400, detail="Is booking mein price nahi likhi")
+
+    trip = await get_own_trip(booking["tripId"], user)
+    if booking.get("currency") != trip.get("currency"):
+        raise HTTPException(
+            status_code=409,
+            detail="Booking aur trip ki currency alag hai, kharcha manually add karein",
+        )
+
+    now = datetime.now(timezone.utc)
+    nights = booking.get("nights", 1)
+    data = {
+        "tripId": booking["tripId"],
+        "title": f"{booking['hotelName']} ({nights} night{'s' if nights > 1 else ''})"[:100],
+        "category": "accommodation",
+        "amount": booking["totalPrice"],
+        "expenseDate": booking["checkIn"],
+        "notes": f"Booking {booking.get('reference', '')}",
+        "userId": user["id"],
+        "bookingId": booking_id,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+
+    try:
+        result = await db.expenses.insert_one(data)
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=409, detail="Is booking ka kharcha pehle se add hai"
+        )
+
+    created = await db.expenses.find_one({"_id": result.inserted_id})
+    return serialize(created)
+
+
+@router.patch("/{expense_id}")
+async def update_expense(
+    expense_id: str,
+    changes: ExpenseUpdate,
+    user: dict = Depends(get_current_user),
+):
+    oid = to_object_id(expense_id, "expense id")
+    update_data = changes.model_dump(mode="json", exclude_unset=True)
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No changes provided")
+    update_data["updatedAt"] = datetime.now(timezone.utc)
+
+    result = await db.expenses.update_one(
+        {"_id": oid, "userId": user["id"]}, {"$set": update_data}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Expense not found")
+
+    doc = await db.expenses.find_one({"_id": oid})
+    return serialize(doc)
+
+
+@router.delete("/{expense_id}", status_code=204)
+async def delete_expense(
+    expense_id: str, user: dict = Depends(get_current_user)
+):
+    result = await db.expenses.delete_one(
+        {"_id": to_object_id(expense_id, "expense id"), "userId": user["id"]}
+    )
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Expense not found")

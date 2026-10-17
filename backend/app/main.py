@@ -1,4 +1,3 @@
-
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -12,7 +11,9 @@ from app.routers import (
     destinations,
     expenses,
     hotels,
+    password_change,
     routes,
+    stops,
     trips,
 )
 
@@ -31,7 +32,28 @@ async def lifespan(app: FastAPI):
     await db.bookings.create_index(
         [("userId", 1), ("createdAt", -1)]
     )
+    await db.expenses.create_index(
+        [("userId", 1), ("tripId", 1), ("expenseDate", -1)]
+    )
+    # Ek booking ka kharcha sirf ek baar add ho
+    await db.expenses.create_index(
+        [("userId", 1), ("bookingId", 1)],
+        unique=True,
+        partialFilterExpression={"bookingId": {"$type": "string"}},
+    )
 
+    # Itinerary stops ke indexes (fail ho to app nahi rukti)
+    try:
+        await db.itinerary_stops.create_index(
+            [("tripId", 1), ("placeId", 1)], unique=True
+        )
+        await db.itinerary_stops.create_index(
+            [("userId", 1), ("tripId", 1), ("dayNumber", 1), ("stopOrder", 1)]
+        )
+    except OperationFailure:
+        pass
+
+    # OAuth index
     try:
         await db.users.drop_index(
             "oauthProvider_1_oauthSubject_1"
@@ -47,6 +69,7 @@ async def lifespan(app: FastAPI):
         },
     )
 
+    # Email index
     await db.users.create_index(
         "email",
         unique=True,
@@ -64,6 +87,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -76,7 +100,9 @@ app.add_middleware(
 
 # Register routers
 app.include_router(auth.router)
+app.include_router(password_change.router)
 app.include_router(trips.router)
+app.include_router(stops.router)
 app.include_router(destinations.router)
 app.include_router(routes.router)
 app.include_router(hotels.router)

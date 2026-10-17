@@ -3,6 +3,7 @@ import re
 from datetime import datetime, timezone
 
 import bcrypt
+from bson import ObjectId
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException
 from google.auth.transport import requests as google_requests
@@ -11,6 +12,7 @@ from pydantic import BaseModel, Field
 from pymongo import ReturnDocument
 from starlette.concurrency import run_in_threadpool
 
+from app.activity import log_activity, user_role
 from app.auth import create_token, get_current_user
 from app.db import db
 
@@ -37,13 +39,26 @@ class LoginIn(BaseModel):
     password: str
 
 
+class ChangePasswordIn(BaseModel):
+    currentPassword: str
+    newPassword: str = Field(min_length=6, max_length=72)
+
+
 def public_user(u: dict) -> dict:
     return {
-        "id": str(u["_id"]),
+        "id": str(u["_id"]) if "_id" in u else u.get("id", ""),
         "name": u.get("name", ""),
         "email": u.get("email", ""),
         "picture": u.get("picture", ""),
+        "role": user_role(u),
     }
+
+
+async def mark_login(user: dict):
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"lastLoginAt": datetime.now(timezone.utc)}},
+    )
 
 
 @router.post("/google")
@@ -71,6 +86,8 @@ async def google_login(body: GoogleLoginIn):
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
+    await mark_login(user)
+    await log_activity(user, "login", {"method": "google"})
     return {"token": create_token(str(user["_id"])), "user": public_user(user)}
 
 
@@ -94,10 +111,12 @@ async def register(body: RegisterIn):
             "name": body.name.strip(),
             "email": email,
             "password_hash": hashed,
+            "role": "user",
             "createdAt": datetime.now(timezone.utc),
         }
     )
     user = await db.users.find_one({"_id": res.inserted_id})
+    await log_activity(user, "signup", {"method": "email"})
     return {"token": create_token(str(res.inserted_id)), "user": public_user(user)}
 
 
@@ -115,10 +134,52 @@ async def login(body: LoginIn):
         body.password.encode(), user["password_hash"].encode()
     )
     if not ok:
+        await log_activity(None, "login_failed", {"email": email})
         raise HTTPException(status_code=401, detail="Email ya password ghalat hai")
+
+    await mark_login(user)
+    await log_activity(user, "login", {"method": "email"})
     return {"token": create_token(str(user["_id"])), "user": public_user(user)}
 
 
 @router.get("/me")
 async def me(user: dict = Depends(get_current_user)):
     return public_user(user)
+
+
+@router.post("/change-password")
+async def change_password(
+    body: ChangePasswordIn, user: dict = Depends(get_current_user)
+):
+    # get_current_user "_id" ki jagah "id" (string) deta hai
+    doc = await db.users.find_one({"_id": ObjectId(user["id"])})
+
+    if not doc or not doc.get("password_hash"):
+        raise HTTPException(
+            status_code=400,
+            detail="Aap Google se login hain, is account ka password yahan change nahi hota",
+        )
+
+    if not bcrypt.checkpw(
+        body.currentPassword.encode(), doc["password_hash"].encode()
+    ):
+        raise HTTPException(status_code=400, detail="Purana password ghalat hai")
+
+    if body.currentPassword == body.newPassword:
+        raise HTTPException(
+            status_code=400,
+            detail="Naya password purane se alag hona chahiye",
+        )
+
+    hashed = bcrypt.hashpw(body.newPassword.encode(), bcrypt.gensalt()).decode()
+    await db.users.update_one(
+        {"_id": doc["_id"]},
+        {
+            "$set": {
+                "password_hash": hashed,
+                "passwordChangedAt": datetime.now(timezone.utc),
+            }
+        },
+    )
+    await log_activity(doc, "password_changed", {})
+    return {"message": "Password change ho gaya"}

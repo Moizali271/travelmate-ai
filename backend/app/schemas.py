@@ -6,6 +6,9 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 Status = Literal["planned", "ongoing", "completed"]
 Mode = Literal["driving", "walking", "cycling"]
+Category = Literal[
+    "accommodation", "food", "transport", "activities", "shopping", "other"
+]
 
 
 class TripCreate(BaseModel):
@@ -123,3 +126,25 @@ class BookingCreate(BaseModel):
 
 class BookingConfirm(BaseModel):
     confirmationNumber: str = Field(default="", max_length=50)
+
+
+class ExpenseCreate(BaseModel):
+    tripId: Optional[str] = Field(default=None, max_length=50)
+    title: str = Field(min_length=1, max_length=100)
+    category: Category = "other"
+    amount: float = Field(gt=0, le=1_000_000_000)
+    expenseDate: date
+    notes: str = Field(default="", max_length=300)
+
+    @field_validator("title", "notes")
+    @classmethod
+    def strip_text(cls, value):
+        return value.strip()
+
+
+class ExpenseUpdate(BaseModel):
+    title: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    category: Optional[Category] = None
+    amount: Optional[float] = Field(default=None, gt=0, le=1_000_000_000)
+    expenseDate: Optional[date] = None
+    notes: Optional[str] = Field(default=None, max_length=300)

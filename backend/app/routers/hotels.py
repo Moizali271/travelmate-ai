@@ -1,8 +1,6 @@
 import asyncio
-import hashlib
 import logging
 import math
-import os
 import re
 import time
 from datetime import date
@@ -12,40 +10,24 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.auth import get_current_user
-
-try:  # .env se PEXELS_API_KEY padhne ke liye (agar python-dotenv installed ho)
-    from dotenv import load_dotenv
-
-    load_dotenv()
-except ImportError:
-    pass
+from app.db import db
 
 router = APIRouter(prefix="/api/hotels", tags=["hotels"])
 logger = logging.getLogger("uvicorn.error")
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+# Pehla server na chale to doosra try hoga
 OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
 ]
 USER_AGENT = "TravelMateAI/1.0 (student project)"
-CACHE_SECONDS = 600
+CACHE_FRESH_SECONDS = 24 * 3600  # itni der tak list dobara server se nahi maangte
 MAX_RESULTS = 60
-ROUNDS = 2
+OVERPASS_TIMEOUT = 20
 
-# Pexels (optional): .env mein PEXELS_API_KEY=xxxx likhein
-PEXELS_URL = "https://api.pexels.com/v1/search"
-PHOTO_CACHE_SECONDS = 86400
-PHOTO_QUERIES = {
-    "hotel": "hotel room interior",
-    "guest_house": "cozy guest house bedroom",
-    "hostel": "hostel dorm room",
-    "motel": "motel room",
-    "apartment": "modern apartment bedroom",
-}
-
-_cache: dict = {}
-_photo_cache: dict = {}
+HOTEL_KINDS = {"hotel", "guest_house", "hostel", "motel", "apartment"}
+NOMINATIM_TERMS = ["hotel", "guest house", "hostel"]
 
 
 def haversine_km(lat1, lon1, lat2, lon2) -> float:
@@ -72,38 +54,9 @@ def build_address(tags: dict) -> str:
     return ", ".join(tags[k] for k in keys if tags.get(k))
 
 
-def parse_amenities(tags: dict) -> list:
-    amenities = []
-
-    internet = str(tags.get("internet_access", "")).lower()
-    if internet in ("wlan", "wifi", "yes", "wired") or tags.get("wifi") == "yes":
-        amenities.append("wifi")
-
-    if tags.get("swimming_pool") == "yes" or tags.get("pool") == "yes":
-        amenities.append("pool")
-
-    if tags.get("air_conditioning") == "yes":
-        amenities.append("ac")
-
-    if tags.get("parking") or tags.get("parking:fee") or tags.get("capacity:parking"):
-        amenities.append("parking")
-
-    if tags.get("wheelchair") in ("yes", "limited"):
-        amenities.append("wheelchair")
-
-    return amenities
-
-
-def valid_image(url) -> str:
-    if not url:
-        return ""
-    url = str(url).strip()
-    return url if url.startswith(("http://", "https://")) else ""
-
-
 def overpass_query(lat: float, lon: float, radius: int) -> str:
-    kinds = "hotel|guest_house|hostel|motel|apartment"
-    return f"""[out:json][timeout:25];
+    kinds = "|".join(sorted(HOTEL_KINDS))
+    return f"""[out:json][timeout:20];
 (
   node["tourism"~"^({kinds})$"](around:{radius},{lat},{lon});
   way["tourism"~"^({kinds})$"](around:{radius},{lat},{lon});
@@ -140,102 +93,164 @@ async def geocode(client: httpx.AsyncClient, text: str) -> dict:
         raise HTTPException(status_code=404, detail="Destination nahi mila")
     item = data[0]
     return {
+        # User ne jo likha wahi naam rakhte hain (jaise "Karachi")
         "name": text.strip().title(),
         "lat": float(item["lat"]),
         "lon": float(item["lon"]),
     }
 
 
-async def fetch_elements(client: httpx.AsyncClient, lat: float, lon: float, radius: int) -> list:
-    key = (round(lat, 3), round(lon, 3), radius)
-    cached = _cache.get(key)
-    if cached and time.time() - cached[0] < CACHE_SECONDS:
-        return cached[1]
-
+async def request_overpass(client: httpx.AsyncClient, lat: float, lon: float, radius: int):
+    """Free Overpass servers se list maangta hai. Na mile to None deta hai."""
     query = overpass_query(lat, lon, radius)
 
-    for attempt in range(ROUNDS):
-        for url in OVERPASS_URLS:
-            try:
-                res = await client.post(
-                    url,
-                    data={"data": query},
-                    headers={"User-Agent": USER_AGENT},
-                )
-            except httpx.HTTPError as err:
-                logger.warning("Overpass %s failed: %s", url, repr(err))
+    for url in OVERPASS_URLS:
+        try:
+            res = await client.post(
+                url,
+                data={"data": query},
+                headers={"User-Agent": USER_AGENT},
+                timeout=OVERPASS_TIMEOUT,
+            )
+        except httpx.HTTPError as err:
+            logger.warning("Overpass %s failed: %s", url, repr(err))
+            continue
+
+        if res.status_code != 200:
+            logger.warning(
+                "Overpass %s status %s: %s",
+                url,
+                res.status_code,
+                res.text[:200].replace("\n", " "),
+            )
+            continue
+
+        try:
+            data = res.json()
+        except ValueError:
+            logger.warning("Overpass %s returned non-JSON", url)
+            continue
+
+        # Kabhi kabhi Overpass 200 deta hai magar query fail hoti hai
+        remark = str(data.get("remark", ""))
+        if not data.get("elements") and "error" in remark.lower():
+            logger.warning("Overpass %s remark: %s", url, remark[:200])
+            continue
+
+        return data.get("elements", [])
+
+    return None
+
+
+async def request_nominatim(client: httpx.AsyncClient, lat: float, lon: float, radius: int):
+    """Overpass na chale to Nominatim se hotels. Overpass jaisi hi shape deta hai."""
+    delta_lat = radius / 111000
+    delta_lon = radius / (111000 * max(math.cos(math.radians(lat)), 0.2))
+    # left, top, right, bottom
+    viewbox = f"{lon - delta_lon},{lat + delta_lat},{lon + delta_lon},{lat - delta_lat}"
+
+    found: dict = {}
+    for index, term in enumerate(NOMINATIM_TERMS):
+        if index > 0:
+            await asyncio.sleep(1.1)  # Nominatim policy: 1 request per second
+
+        try:
+            res = await client.get(
+                NOMINATIM_URL,
+                params={
+                    "q": term,
+                    "format": "jsonv2",
+                    "limit": 40,
+                    "viewbox": viewbox,
+                    "bounded": 1,
+                    "extratags": 1,
+                    "addressdetails": 1,
+                    "accept-language": "en",
+                },
+                headers={"User-Agent": USER_AGENT},
+            )
+        except httpx.HTTPError as err:
+            logger.warning("Nominatim fallback '%s' failed: %s", term, repr(err))
+            continue
+
+        if res.status_code != 200:
+            logger.warning("Nominatim fallback '%s' status %s", term, res.status_code)
+            continue
+
+        try:
+            items = res.json()
+        except ValueError:
+            continue
+
+        for item in items:
+            kind = item.get("type")
+            if item.get("category") != "tourism" or kind not in HOTEL_KINDS:
                 continue
 
-            if res.status_code != 200:
-                logger.warning(
-                    "Overpass %s status %s: %s",
-                    url,
-                    res.status_code,
-                    res.text[:200].replace("\n", " "),
-                )
+            name = item.get("name") or ""
+            if not name:
                 continue
 
-            try:
-                data = res.json()
-            except ValueError:
-                logger.warning("Overpass %s returned non-JSON", url)
+            extra = item.get("extratags") or {}
+            address = item.get("address") or {}
+            osm_type = item.get("osm_type", "node")
+            osm_id = item.get("osm_id")
+            if osm_id is None:
                 continue
 
-            remark = str(data.get("remark", ""))
-            if not data.get("elements") and "error" in remark.lower():
-                logger.warning("Overpass %s remark: %s", url, remark[:200])
-                continue
+            tags = {
+                "name": name,
+                "tourism": kind,
+                "stars": extra.get("stars"),
+                "website": extra.get("website") or extra.get("contact:website"),
+                "phone": extra.get("phone") or extra.get("contact:phone"),
+                "addr:street": address.get("road"),
+                "addr:suburb": address.get("suburb") or address.get("neighbourhood"),
+                "addr:city": address.get("city") or address.get("town"),
+            }
+            found[(osm_type, osm_id)] = {
+                "type": osm_type,
+                "id": osm_id,
+                "lat": float(item["lat"]),
+                "lon": float(item["lon"]),
+                "tags": {k: v for k, v in tags.items() if v},
+            }
 
-            elements = data.get("elements", [])
-            _cache[key] = (time.time(), elements)
-            return elements
+    logger.warning("Nominatim fallback ne %d hotels diye", len(found))
+    return list(found.values())
 
-        if attempt < ROUNDS - 1:
-            await asyncio.sleep(2)
+
+async def fetch_elements(client: httpx.AsyncClient, lat: float, lon: float, radius: int):
+    """(elements, stale). Pehle MongoDB cache, phir Overpass, phir Nominatim,
+    phir purani cache."""
+    key = f"{round(lat, 3)}:{round(lon, 3)}:{radius}"
+    cached = await db.hotel_cache.find_one({"_id": key})
+
+    if cached and time.time() - cached.get("savedAtTs", 0) < CACHE_FRESH_SECONDS:
+        return cached["elements"], False
+
+    elements = await request_overpass(client, lat, lon, radius)
+
+    if not elements:
+        # Overpass fail hui ya khali aayi, doosre source se koshish
+        elements = await request_nominatim(client, lat, lon, radius)
+
+    if elements:
+        await db.hotel_cache.update_one(
+            {"_id": key},
+            {"$set": {"elements": elements, "savedAtTs": time.time()}},
+            upsert=True,
+        )
+        return elements, False
+
+    if cached:
+        logger.warning("Data sources busy, purani saved hotel list use ho rahi hai (%s)", key)
+        return cached["elements"], True
 
     raise HTTPException(
         status_code=502,
         detail="Hotel data service abhi busy hai, thori der baad try karo",
     )
-
-
-async def fetch_stock_photos(client: httpx.AsyncClient, kind: str) -> list:
-    api_key = os.getenv("PEXELS_API_KEY", "").strip()
-    if not api_key:
-        return []
-
-    cached = _photo_cache.get(kind)
-    if cached and time.time() - cached[0] < PHOTO_CACHE_SECONDS:
-        return cached[1]
-
-    query = PHOTO_QUERIES.get(kind, "hotel room interior")
-    try:
-        res = await client.get(
-            PEXELS_URL,
-            params={"query": query, "per_page": 15, "orientation": "landscape"},
-            headers={"Authorization": api_key, "User-Agent": USER_AGENT},
-        )
-        if res.status_code != 200:
-            logger.warning("Pexels status %s", res.status_code)
-            return []
-        photos = [
-            {"url": p["src"]["medium"]}
-            for p in res.json().get("photos", [])
-            if p.get("src", {}).get("medium")
-        ]
-    except (httpx.HTTPError, ValueError, KeyError) as err:
-        logger.warning("Pexels failed: %s", repr(err))
-        return []
-
-    _photo_cache[kind] = (time.time(), photos)
-    return photos
-
-
-def pick_photo(photos: list, hotel_id: str):
-    if not photos:
-        return None
-    index = int(hashlib.md5(hotel_id.encode()).hexdigest(), 16) % len(photos)
-    return photos[index]
 
 
 @router.get("/search")
@@ -255,9 +270,11 @@ async def search_hotels(
         raise HTTPException(status_code=400, detail="Zyada se zyada 30 raatein")
 
     try:
-        async with httpx.AsyncClient(timeout=35) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             place = await geocode(client, q.strip())
-            elements = await fetch_elements(client, place["lat"], place["lon"], radius)
+            elements, stale = await fetch_elements(
+                client, place["lat"], place["lon"], radius
+            )
     except httpx.HTTPError:
         raise HTTPException(status_code=502, detail="Hotel service se rabta nahi ho saka")
 
@@ -271,7 +288,6 @@ async def search_hotels(
         if not name or lat is None or lon is None:
             continue
 
-        own_image = valid_image(tags.get("image"))
         hotels.append(
             {
                 "id": f"{el.get('type')}/{el.get('id')}",
@@ -284,41 +300,19 @@ async def search_hotels(
                 "address": build_address(tags),
                 "phone": tags.get("phone") or tags.get("contact:phone") or "",
                 "website": tags.get("website") or tags.get("contact:website") or "",
-                "amenities": parse_amenities(tags),
-                "image": own_image,
-                "imageSource": "osm" if own_image else "",
                 "bookingUrl": booking_link(name, place["name"], checkIn, checkOut, guests),
                 "mapsUrl": maps_link(name, place["name"]),
             }
         )
 
     hotels.sort(key=lambda h: h["distanceKm"])
-    hotels = hotels[:MAX_RESULTS]
-
-    # Jin hotels ki apni photo nahi, unke liye Pexels stock photo (agar key ho)
-    kinds = list({h["type"] for h in hotels if not h["image"]})
-    if kinds and os.getenv("PEXELS_API_KEY", "").strip():
-        try:
-            async with httpx.AsyncClient(timeout=10) as photo_client:
-                lists = await asyncio.gather(
-                    *[fetch_stock_photos(photo_client, k) for k in kinds]
-                )
-            photos_by_kind = dict(zip(kinds, lists))
-            for hotel in hotels:
-                if hotel["image"]:
-                    continue
-                photo = pick_photo(photos_by_kind.get(hotel["type"], []), hotel["id"])
-                if photo:
-                    hotel["image"] = photo["url"]
-                    hotel["imageSource"] = "stock"
-        except Exception as err:
-            logger.warning("Photo step failed: %s", repr(err))
 
     return {
         "destination": place,
         "checkIn": str(checkIn),
         "checkOut": str(checkOut),
         "guests": guests,
-        "count": len(hotels),
-        "hotels": hotels,
+        "stale": stale,
+        "count": len(hotels[:MAX_RESULTS]),
+        "hotels": hotels[:MAX_RESULTS],
     }

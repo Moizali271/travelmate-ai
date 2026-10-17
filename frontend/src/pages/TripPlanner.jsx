@@ -1,6 +1,5 @@
-
 import { useEffect, useState } from "react";
-import { useLocation } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import { authFetch } from "../services/authFetch";
 
 const API_URL = "/api/trips";
@@ -162,6 +161,14 @@ export default function TripPlanner() {
   }
 
   async function handleDelete(id) {
+    if (
+      !window.confirm(
+        "Kya aap ye trip delete karna chahte hain? Iske stops, routes aur expenses bhi hat jayenge."
+      )
+    ) {
+      return;
+    }
+
     setError("");
     setMessage("");
 
@@ -391,13 +398,22 @@ export default function TripPlanner() {
                     </p>
                   </div>
 
-                  <button
-                    type="button"
-                    onClick={() => handleDelete(trip.id)}
-                    className="rounded-xl border border-red-200 px-4 py-2 font-semibold text-red-700 transition hover:bg-red-50"
-                  >
-                    Delete Trip
-                  </button>
+                  <div className="flex flex-col gap-2 sm:items-end">
+                    <Link
+                      to={`/trips/${trip.id}/itinerary`}
+                      className="rounded-xl border border-[#D4AF37] bg-[#3B0718] px-4 py-2 text-center font-semibold text-white transition hover:text-[#D4AF37]"
+                    >
+                      ✦ Plan Itinerary
+                    </Link>
+
+                    <button
+                      type="button"
+                      onClick={() => handleDelete(trip.id)}
+                      className="rounded-xl border border-red-200 px-4 py-2 font-semibold text-red-700 transition hover:bg-red-50"
+                    >
+                      Delete Trip
+                    </button>
+                  </div>
                 </div>
               </li>
             ))}

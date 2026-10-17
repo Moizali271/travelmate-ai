@@ -82,6 +82,9 @@ async def delete_trip(trip_id: str, user: dict = Depends(get_current_user)):
     await db.itinerary_stops.delete_many({"tripId": trip_id, "userId": user["id"]})
     # trip ke saath uske saved routes bhi hata dein
     await db.routes.delete_many({"tripId": trip_id, "userId": user["id"]})
+    # trip ke saath uske expenses aur budget bhi hata dein
+    await db.expenses.delete_many({"tripId": trip_id, "userId": user["id"]})
+    await db.expense_budgets.delete_many({"tripId": trip_id, "userId": user["id"]})
     # bookings delete nahi hongi, sirf trip se alag ho jayengi
     await db.bookings.update_many(
         {"tripId": trip_id, "userId": user["id"]},
