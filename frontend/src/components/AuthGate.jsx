@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { GoogleLogin } from "@react-oauth/google";
 import { useAuth } from "../context/AuthContext";
+import ChangePasswordForm from "./ChangePasswordForm";
 
 export default function AuthGate({ children }) {
   const { user, loading, loginWithGoogle, login, register, logout } = useAuth();
@@ -25,6 +26,26 @@ export default function AuthGate({ children }) {
     } finally {
       setBusy(false);
     }
+  }
+
+  if (!user && mode === "change") {
+    return (
+      <div className="flex min-h-screen flex-col items-center justify-center gap-4 px-4">
+        <h1 className="text-4xl font-bold text-blue-600">TravelMate AI</h1>
+        <p className="text-gray-600">Apna password badlein</p>
+
+        <div className="w-full max-w-sm">
+          <ChangePasswordForm
+            defaultEmail={email}
+            onBack={() => {
+              setError("");
+              setPassword("");
+              setMode("login");
+            }}
+          />
+        </div>
+      </div>
+    );
   }
 
   if (!user) {
@@ -89,6 +110,18 @@ export default function AuthGate({ children }) {
               ? "Account nahi hai? Register karein"
               : "Pehle se account hai? Login karein"}
           </button>
+          {mode === "login" && (
+            <button
+              type="button"
+              className="text-sm text-blue-600 underline"
+              onClick={() => {
+                setError("");
+                setMode("change");
+              }}
+            >
+              Password badalna hai?
+            </button>
+          )}
         </form>
 
         <p className="text-sm text-gray-500">ya</p>

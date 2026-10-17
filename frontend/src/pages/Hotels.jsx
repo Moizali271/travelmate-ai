@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   MapContainer,
@@ -120,14 +120,24 @@ function FitHotels({ hotels, center }) {
   return null;
 }
 
-function FocusHotel({ hotel }) {
+// focus = { hotel, nonce }. Har click par naya object banta hai,
+// is liye wahi hotel dobara dabane par bhi ye chalta hai
+function FocusHotel({ focus, markerRefs }) {
   const map = useMap();
 
   useEffect(() => {
-    if (hotel) {
-      map.flyTo([hotel.lat, hotel.lon], 16, { duration: 1 });
-    }
-  }, [hotel, map]);
+    if (!focus) return undefined;
+
+    const { hotel } = focus;
+    map.flyTo([hotel.lat, hotel.lon], 16, { duration: 1 });
+
+    // Zoom khatam hone ke baad hotel ka popup kholo
+    const timer = setTimeout(() => {
+      markerRefs.current[hotel.id]?.openPopup();
+    }, 1100);
+
+    return () => clearTimeout(timer);
+  }, [focus, map, markerRefs]);
 
   return null;
 }
@@ -165,6 +175,9 @@ function HotelPhoto({ hotel }) {
 export default function Hotels() {
   const navigate = useNavigate();
   const today = todayString();
+
+  const mapSectionRef = useRef(null);
+  const markerRefs = useRef({});
 
   const [destination, setDestination] = useState("");
   const [checkIn, setCheckIn] = useState("");
@@ -230,6 +243,7 @@ export default function Hotels() {
     setResult(null);
     setFocused(null);
     setReserveHotel(null);
+    markerRefs.current = {};
 
     if (!destination.trim()) {
       setError("Please destination enter karein.");
@@ -293,6 +307,15 @@ export default function Hotels() {
     } finally {
       setLoading(false);
     }
+  }
+
+  // Map tak scroll karo aur hotel par zoom karo
+  function showOnMap(hotel) {
+    setFocused({ hotel, nonce: Date.now() });
+    mapSectionRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
   }
 
   function openReserve(hotel) {
@@ -584,7 +607,7 @@ export default function Hotels() {
             </p>
 
             <h2 className="mt-1 text-2xl font-extrabold text-[#3B0718]">
-              Hotels in {destination.trim()}
+              Hotels in {result?.destination?.name || destination.trim()}
             </h2>
 
             <p className="mt-2 text-sm text-gray-600">
@@ -665,7 +688,10 @@ export default function Hotels() {
                 <span>Hotel data © OpenStreetMap contributors</span>
               </div>
 
-              <div className="mt-4 overflow-hidden rounded-2xl border border-[#D4AF37] shadow-md">
+              <div
+                ref={mapSectionRef}
+                className="mt-4 scroll-mt-4 overflow-hidden rounded-2xl border border-[#D4AF37] shadow-md"
+              >
                 <div className="bg-[#3B0718] px-5 py-4">
                   <h3 className="font-bold text-white">Hotels Map</h3>
                 </div>
@@ -685,12 +711,15 @@ export default function Hotels() {
                     hotels={visibleHotels}
                     center={result.destination}
                   />
-                  <FocusHotel hotel={focused} />
+                  <FocusHotel focus={focused} markerRefs={markerRefs} />
 
                   {visibleHotels.map((hotel) => (
                     <Marker
                       key={hotel.id}
                       position={[hotel.lat, hotel.lon]}
+                      ref={(marker) => {
+                        if (marker) markerRefs.current[hotel.id] = marker;
+                      }}
                     >
                       <Popup>
                         <strong>{hotel.name}</strong>
@@ -796,7 +825,7 @@ export default function Hotels() {
                       <div className="grid grid-cols-2 gap-2">
                         <button
                           type="button"
-                          onClick={() => setFocused(hotel)}
+                          onClick={() => showOnMap(hotel)}
                           className="rounded-lg border border-[#D4AF37] bg-[#F7EAC0] px-3 py-2 text-sm font-bold text-[#3B0718] hover:bg-[#D4AF37]"
                         >
                           Show on map

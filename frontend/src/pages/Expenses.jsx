@@ -1,528 +1,703 @@
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
-  Bar,
-  BarChart,
-  CartesianGrid,
-  Cell,
-  Legend,
-  Pie,
   PieChart,
-  ResponsiveContainer,
+  Pie,
+  Cell,
   Tooltip,
+  ResponsiveContainer,
+  BarChart,
+  Bar,
   XAxis,
   YAxis,
+  CartesianGrid,
+  LabelList,
 } from "recharts";
 
-const API_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+const API_URL =
+  import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
 const CATEGORIES = [
-  { value: "accommodation", label: "Accommodation", color: "#3B0718" },
-  { value: "transport", label: "Transport & Fuel", color: "#D4AF37" },
-  { value: "food", label: "Food", color: "#C0392B" },
-  { value: "tickets", label: "Attraction Tickets", color: "#2E86AB" },
-  { value: "shopping", label: "Shopping", color: "#8E44AD" },
-  { value: "other", label: "Other", color: "#7F8C8D" },
+  { value: "accommodation", label: "Accommodation", icon: "🏨", color: "#7C3AED" },
+  { value: "food", label: "Food", icon: "🍽️", color: "#F97316" },
+  { value: "transport", label: "Transport", icon: "🚗", color: "#2563EB" },
+  { value: "activities", label: "Activities", icon: "🎟️", color: "#16A34A" },
+  { value: "shopping", label: "Shopping", icon: "🛍️", color: "#DB2777" },
+  { value: "other", label: "Other", icon: "📌", color: "#6B7280" },
 ];
 
-const labelOf = (value) =>
-  CATEGORIES.find((c) => c.value === value)?.label || value;
-const colorOf = (value) =>
-  CATEGORIES.find((c) => c.value === value)?.color || "#7F8C8D";
+const CURRENCIES = ["PKR", "USD", "EUR", "GBP", "AED", "SAR"];
 
-const today = () => new Date().toISOString().slice(0, 10);
+function categoryInfo(value) {
+  return (
+    CATEGORIES.find((c) => c.value === value) || {
+      value,
+      label: value,
+      icon: "📌",
+      color: "#6B7280",
+    }
+  );
+}
 
-const emptyForm = () => ({
-  category: "food",
-  amount: "",
-  description: "",
-  expenseDate: today(),
-});
+function categoryLabel(value) {
+  return categoryInfo(value).label;
+}
+
+function categoryColor(value) {
+  return categoryInfo(value).color;
+}
+
+function shortDate(value) {
+  const date = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+}
+
+function compactNumber(value) {
+  return new Intl.NumberFormat("en", { notation: "compact" }).format(
+    Number(value || 0)
+  );
+}
+
+function todayString() {
+  const date = new Date();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${date.getFullYear()}-${month}-${day}`;
+}
+
+function money(currency, value) {
+  return `${currency} ${Number(value || 0).toLocaleString()}`;
+}
 
 function getToken() {
-  return localStorage.getItem("token") || localStorage.getItem("access_token");
+  return (
+    localStorage.getItem("token") ||
+    localStorage.getItem("access_token")
+  );
 }
 
 async function api(path, options = {}) {
+  const headers = { "Content-Type": "application/json" };
   const token = getToken();
-  if (!token) throw new Error("Login session nahi mili. Please log in again.");
+  if (token) headers.Authorization = `Bearer ${token}`;
 
-  const response = await fetch(`${API_URL}${path}`, {
+  const res = await fetch(`${API_URL}${path}`, {
     ...options,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-      ...(options.headers || {}),
-    },
+    headers: { ...headers, ...(options.headers || {}) },
   });
 
-  if (!response.ok) {
-    if (response.status === 401 || response.status === 403) {
-      throw new Error("Login session expire ho gayi. Dobara login karein.");
+  if (!res.ok) {
+    if (res.status === 401 || res.status === 403) {
+      throw new Error("Please log in again.");
     }
-    const body = await response.json().catch(() => ({}));
+    const body = await res.json().catch(() => ({}));
     const detail = Array.isArray(body.detail)
-      ? body.detail
-          .map((d) => `${(d.loc || []).join(".")}: ${d.msg}`)
-          .join(", ")
+      ? body.detail.map((d) => d.msg).join(", ")
       : body.detail;
-    throw new Error(detail || "Request fail ho gayi.");
+    throw new Error(detail || "Kuch ghalat ho gaya, dobara try karein.");
   }
-  return response.json();
-}
 
-const money = (n) =>
-  Number(n || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
+  if (res.status === 204) return null;
+  return res.json();
+}
 
 export default function Expenses() {
   const [trips, setTrips] = useState([]);
-  const [tripId, setTripId] = useState("");
-  const [expenses, setExpenses] = useState([]);
+  const [tripId, setTripId] = useState("general");
   const [summary, setSummary] = useState(null);
-  const [budgetInput, setBudgetInput] = useState("");
-  const [currency, setCurrency] = useState("PKR");
-  const [form, setForm] = useState(emptyForm());
-  const [editingId, setEditingId] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
+  const [expenses, setExpenses] = useState([]);
+  const [bookings, setBookings] = useState([]);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
 
-  const query = tripId ? `?tripId=${encodeURIComponent(tripId)}` : "";
+  // Set Budget form
+  const [budgetAmount, setBudgetAmount] = useState("");
+  const [budgetCurrency, setBudgetCurrency] = useState("PKR");
+  const [savingBudget, setSavingBudget] = useState(false);
 
-  useEffect(() => {
-    api("/api/trips")
-      .then((data) => {
-        const list = Array.isArray(data) ? data : data?.trips || [];
-        setTrips(list);
-      })
-      .catch(() => setTrips([]));
-  }, []);
+  // Add Expense form
+  const [category, setCategory] = useState("food");
+  const [amount, setAmount] = useState("");
+  const [expenseDate, setExpenseDate] = useState(todayString());
+  const [title, setTitle] = useState("");
+  const [adding, setAdding] = useState(false);
 
-  const load = useCallback(async () => {
+  const isGeneral = tripId === "general";
+
+  async function loadData(currentTripId) {
     setLoading(true);
     setError("");
+
     try {
-      const [list, sum] = await Promise.all([
-        api(`/api/expenses${query}`),
-        api(`/api/expenses/summary${query}`),
-      ]);
-      setExpenses(Array.isArray(list) ? list : []);
-      setSummary(sum);
-      setCurrency(sum.currency || "PKR");
-      setBudgetInput(sum.budget ? String(sum.budget) : "");
+      const [summaryData, expenseData, tripData, bookingData] =
+        await Promise.all([
+          api(`/api/expenses/summary?tripId=${currentTripId}`),
+          api(`/api/expenses?tripId=${currentTripId}`),
+          api("/api/trips"),
+          api("/api/bookings").catch(() => []),
+        ]);
+
+      setSummary(summaryData);
+      setExpenses(expenseData);
+      setTrips(Array.isArray(tripData) ? tripData : []);
+      setBookings(Array.isArray(bookingData) ? bookingData : []);
+      setBudgetAmount(summaryData.budget ? String(summaryData.budget) : "");
+      setBudgetCurrency(summaryData.currency);
     } catch (err) {
-      setError(err.message || "Backend se connection nahi ho saka.");
+      setError(err.message);
     } finally {
       setLoading(false);
     }
-  }, [query]);
+  }
 
+  // Trip badalne par (aur page khulte hi) data dobara aata hai,
+  // is liye Trip Planner mein badla hua budget yahan khud nazar aata hai
   useEffect(() => {
-    load();
-  }, [load]);
+    loadData(tripId);
+  }, [tripId]);
 
   async function saveBudget(e) {
     e.preventDefault();
     setError("");
-    try {
-      await api(`/api/expenses/set-budget${query}`, {
-        method: "POST",
-        body: JSON.stringify({
-          budget: Number(budgetInput || 0),
-          currency,
-        }),
-      });
-      await load();
-    } catch (err) {
-      setError(err.message);
-    }
-  }
+    setMessage("");
 
-  async function saveExpense(e) {
-    e.preventDefault();
-    setError("");
-
-    if (!form.amount || Number(form.amount) <= 0) {
-      setError("Amount 0 se zyada hona chahiye.");
+    const value = Number(budgetAmount);
+    if (!Number.isFinite(value) || value < 0) {
+      setError("Budget sahi number mein likhein.");
       return;
     }
 
-    setSaving(true);
+    setSavingBudget(true);
     try {
-      const payload = {
-        tripId: tripId || null,
-        category: form.category,
-        amount: Number(form.amount),
-        description: form.description,
-        expenseDate: form.expenseDate,
-      };
-
-      if (editingId) {
-        await api(`/api/expenses/${editingId}`, {
+      if (isGeneral) {
+        await api("/api/expenses/budget/general", {
           method: "PUT",
-          body: JSON.stringify(payload),
+          body: JSON.stringify({ amount: value, currency: budgetCurrency }),
         });
       } else {
-        await api("/api/expenses", {
-          method: "POST",
-          body: JSON.stringify(payload),
+        await api(`/api/trips/${tripId}`, {
+          method: "PATCH",
+          body: JSON.stringify({ budget: value, currency: budgetCurrency }),
         });
       }
-
-      setForm(emptyForm());
-      setEditingId("");
-      await load();
+      setMessage("Budget save ho gaya ✅");
+      await loadData(tripId);
     } catch (err) {
       setError(err.message);
     } finally {
-      setSaving(false);
+      setSavingBudget(false);
     }
   }
 
-  function startEdit(item) {
-    setEditingId(item.id);
-    setForm({
-      category: item.category,
-      amount: String(item.amount),
-      description: item.description || "",
-      expenseDate: item.expenseDate || today(),
-    });
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  }
-
-  function cancelEdit() {
-    setEditingId("");
-    setForm(emptyForm());
-  }
-
-  async function removeExpense(id) {
-    if (!window.confirm("Kya aap ye expense delete karna chahte hain?")) return;
+  async function addExpense(e) {
+    e.preventDefault();
     setError("");
+    setMessage("");
+
+    const value = Number(amount);
+    if (!Number.isFinite(value) || value <= 0) {
+      setError("Amount 0 se zyada hona chahiye.");
+      return;
+    }
+    if (!title.trim()) {
+      setError("Kharche ka naam ya detail likhein.");
+      return;
+    }
+
+    setAdding(true);
     try {
-      await api(`/api/expenses/${id}`, { method: "DELETE" });
-      if (editingId === id) cancelEdit();
-      await load();
+      await api("/api/expenses", {
+        method: "POST",
+        body: JSON.stringify({
+          tripId: isGeneral ? null : tripId,
+          title: title.trim(),
+          category,
+          amount: value,
+          expenseDate,
+        }),
+      });
+      setAmount("");
+      setTitle("");
+      setMessage("Expense add ho gaya ✅");
+      await loadData(tripId);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setAdding(false);
+    }
+  }
+
+  async function deleteExpense(item) {
+    if (!window.confirm("Ye expense delete karein?")) return;
+
+    setError("");
+    setMessage("");
+    try {
+      await api(`/api/expenses/${item.id}`, { method: "DELETE" });
+      await loadData(tripId);
     } catch (err) {
       setError(err.message);
     }
   }
 
-  const spent = summary?.totalSpent || 0;
-  const budget = summary?.budget || 0;
-  const remaining = summary?.remaining || 0;
-  const percent = Math.min(summary?.percentUsed || 0, 100);
-  const overBudget = budget > 0 && remaining < 0;
+  async function addFromBooking(booking) {
+    setError("");
+    setMessage("");
+    try {
+      await api(`/api/expenses/from-booking/${booking.id}`, {
+        method: "POST",
+      });
+      setMessage("Hotel ka kharcha add ho gaya ✅");
+      await loadData(tripId);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
 
-  const pieData = (summary?.byCategory || []).map((c) => ({
-    name: labelOf(c.category),
-    value: c.total,
-    color: colorOf(c.category),
+  // Is trip ki wo bookings jinka kharcha abhi add nahi hua
+  const pendingBookings = useMemo(() => {
+    if (isGeneral) return [];
+    const added = new Set(
+      expenses.filter((x) => x.bookingId).map((x) => x.bookingId)
+    );
+    return bookings.filter(
+      (b) =>
+        b.tripId === tripId &&
+        b.status !== "cancelled" &&
+        b.totalPrice !== null &&
+        b.totalPrice !== undefined &&
+        !added.has(b.id)
+    );
+  }, [bookings, expenses, tripId, isGeneral]);
+
+  const currency = summary?.currency || "PKR";
+  const totalSpent = summary?.totalSpent || 0;
+
+  const categoryData = (summary?.byCategory || []).map((row) => ({
+    key: row.category,
+    name: categoryLabel(row.category),
+    value: row.total,
   }));
   const dayData = summary?.byDay || [];
 
   const inputCls =
-    "w-full rounded-lg border border-gray-300 px-3 py-2 focus:border-[#D4AF37] focus:outline-none";
+    "w-full rounded-xl border border-gray-300 bg-white px-4 py-3 text-[#3B0718] outline-none focus:border-[#D4AF37]";
 
   return (
-    <div className="min-h-screen bg-white p-6">
-      <div className="rounded-2xl border border-[#D4AF37] bg-[#3B0718] p-8 text-white">
-        <h1 className="text-3xl font-bold text-[#D4AF37]">Expense Tracker</h1>
+    <div className="min-h-screen bg-white p-4 sm:p-6">
+      {/* Header */}
+      <header className="rounded-2xl border border-[#D4AF37] bg-[#3B0718] p-6 text-white shadow-lg sm:p-8">
+        <h1 className="text-3xl font-bold text-[#D4AF37] sm:text-4xl">
+          Expense Tracker
+        </h1>
         <p className="mt-3 text-gray-200">
           Manage your travel expenses with TravelMate AI.
         </p>
 
-        <div className="mt-5 max-w-sm">
-          <label className="mb-1 block text-sm text-gray-200">Trip</label>
-          <select
-            value={tripId}
-            onChange={(e) => {
-              setTripId(e.target.value);
-              cancelEdit();
-            }}
-            className="w-full rounded-lg border border-[#D4AF37] bg-[#3B0718] px-3 py-2 text-white"
-          >
-            <option value="" className="bg-[#3B0718] text-white">
-              General (no trip)
+        <label className="mt-6 block text-sm font-semibold text-white">
+          Trip
+        </label>
+        <select
+          value={tripId}
+          onChange={(e) => {
+            setMessage("");
+            setError("");
+            setTripId(e.target.value);
+          }}
+          className="mt-2 w-full max-w-md rounded-xl border border-[#D4AF37] bg-[#3B0718] px-4 py-3 text-white outline-none"
+        >
+          <option value="general">General (no trip)</option>
+          {trips.map((trip) => (
+            <option key={trip.id} value={trip.id}>
+              {trip.title} · {trip.destination}
             </option>
-            {trips.map((t) => {
-              const id = t.id || t._id;
-              return (
-                <option
-                  key={id}
-                  value={id}
-                  className="bg-[#3B0718] text-white"
-                >
-                  {t.title || t.destination || "Trip"}
-                </option>
-              );
-            })}
-          </select>
-        </div>
-      </div>
+          ))}
+        </select>
+      </header>
 
       {error && (
-        <div className="mt-5 rounded-xl border border-red-200 bg-red-50 p-4 text-red-700">
+        <p className="mt-6 rounded-xl border border-red-200 bg-red-50 p-4 text-red-700">
           {error}
+        </p>
+      )}
+      {message && (
+        <p className="mt-6 rounded-xl border border-green-200 bg-green-50 p-4 text-green-700">
+          {message}
+        </p>
+      )}
+
+      {/* Summary cards */}
+      <section className="mt-6 grid gap-4 sm:grid-cols-3">
+        <div className="rounded-2xl border border-[#D4AF37]/60 bg-[#FFFDF8] p-5">
+          <p className="text-sm text-gray-600">Budget</p>
+          <p className="mt-2 text-3xl font-extrabold text-[#3B0718]">
+            {money(currency, summary?.budget)}
+          </p>
+        </div>
+
+        <div className="rounded-2xl border border-[#D4AF37]/60 bg-[#FFFDF8] p-5">
+          <p className="text-sm text-gray-600">Total spent</p>
+          <p className="mt-2 text-3xl font-extrabold text-[#3B0718]">
+            {money(currency, totalSpent)}
+          </p>
+          <p className="mt-1 text-xs text-gray-500">
+            {summary?.expenseCount || 0} expense
+            {summary?.expenseCount === 1 ? "" : "s"}
+          </p>
+        </div>
+
+        <div
+          className={`rounded-2xl border p-5 ${
+            summary?.overBudget
+              ? "border-red-300 bg-red-50"
+              : "border-[#D4AF37]/60 bg-[#FFFDF8]"
+          }`}
+        >
+          <p className="text-sm text-gray-600">
+            {summary?.overBudget ? "Over budget by" : "Remaining"}
+          </p>
+          <p
+            className={`mt-2 text-3xl font-extrabold ${
+              summary?.overBudget ? "text-red-700" : "text-[#3B0718]"
+            }`}
+          >
+            {money(currency, Math.abs(summary?.remaining || 0))}
+          </p>
+        </div>
+      </section>
+
+      {summary?.percentUsed !== null && summary?.percentUsed !== undefined && (
+        <div className="mt-4">
+          <div className="flex justify-between text-sm text-gray-600">
+            <span>Budget used</span>
+            <span>{summary.percentUsed}%</span>
+          </div>
+          <div className="mt-1 h-3 overflow-hidden rounded-full bg-gray-200">
+            <div
+              className={`h-full rounded-full ${
+                summary.overBudget ? "bg-red-600" : "bg-[#D4AF37]"
+              }`}
+              style={{ width: `${Math.min(summary.percentUsed, 100)}%` }}
+            />
+          </div>
         </div>
       )}
 
-      {loading && !summary ? (
-        <p className="mt-6 text-gray-600">Loading...</p>
-      ) : (
-        <>
-          <div className="mt-6 grid gap-4 md:grid-cols-3">
-            <div className="rounded-2xl border border-[#D4AF37]/60 p-5">
-              <p className="text-sm text-gray-500">Budget</p>
-              <p className="mt-1 text-2xl font-extrabold text-[#3B0718]">
-                {currency} {money(budget)}
-              </p>
-            </div>
-            <div className="rounded-2xl border border-[#D4AF37]/60 p-5">
-              <p className="text-sm text-gray-500">Total spent</p>
-              <p className="mt-1 text-2xl font-extrabold text-[#3B0718]">
-                {currency} {money(spent)}
-              </p>
-            </div>
-            <div
-              className={`rounded-2xl border p-5 ${
-                overBudget
-                  ? "border-red-300 bg-red-50"
-                  : "border-[#D4AF37]/60"
-              }`}
+      {/* Forms */}
+      <section className="mt-6 grid gap-6 lg:grid-cols-2">
+        <form
+          onSubmit={saveBudget}
+          className="rounded-2xl border border-[#D4AF37]/60 bg-[#FFFDF8] p-5 sm:p-6"
+        >
+          <h2 className="text-2xl font-extrabold text-[#3B0718]">
+            Set Budget
+          </h2>
+          <p className="mt-1 text-sm text-gray-600">
+            {isGeneral
+              ? "Ye General (trip ke baghair) ka apna budget hai."
+              : "Ye is trip ka budget hai. Trip Planner mein bhi yahi dikhega."}
+          </p>
+
+          <div className="mt-4 grid grid-cols-[1fr_120px] gap-3">
+            <input
+              className={inputCls}
+              type="number"
+              min="0"
+              step="any"
+              value={budgetAmount}
+              onChange={(e) => setBudgetAmount(e.target.value)}
+              placeholder="Budget"
+              required
+            />
+            <select
+              className={inputCls}
+              value={budgetCurrency}
+              onChange={(e) => setBudgetCurrency(e.target.value)}
             >
-              <p className="text-sm text-gray-500">Remaining</p>
-              <p
-                className={`mt-1 text-2xl font-extrabold ${
-                  overBudget ? "text-red-700" : "text-[#3B0718]"
-                }`}
-              >
-                {currency} {money(remaining)}
-              </p>
-            </div>
+              {CURRENCIES.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+            </select>
           </div>
 
-          {budget > 0 && (
-            <div className="mt-4">
-              <div className="h-3 w-full overflow-hidden rounded-full bg-gray-200">
-                <div
-                  className={`h-full ${
-                    overBudget ? "bg-red-600" : "bg-[#D4AF37]"
-                  }`}
-                  style={{ width: `${percent}%` }}
-                />
-              </div>
-              <p className="mt-1 text-sm text-gray-600">
-                {summary?.percentUsed || 0}% budget used
-                {overBudget && " — budget se zyada kharcha ho gaya!"}
-              </p>
-            </div>
-          )}
+          <button
+            type="submit"
+            disabled={savingBudget}
+            className="mt-4 rounded-xl border border-[#D4AF37] bg-[#3B0718] px-6 py-3 font-bold text-white hover:text-[#D4AF37] disabled:opacity-60"
+          >
+            {savingBudget ? "Saving..." : "Save Budget"}
+          </button>
+        </form>
 
-          <div className="mt-6 grid gap-6 lg:grid-cols-2">
-            <form
-              onSubmit={saveBudget}
-              className="rounded-2xl border border-[#D4AF37]/60 p-5"
+        <form
+          onSubmit={addExpense}
+          className="rounded-2xl border border-[#D4AF37]/60 bg-[#FFFDF8] p-5 sm:p-6"
+        >
+          <h2 className="text-2xl font-extrabold text-[#3B0718]">
+            Add Expense
+          </h2>
+
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <select
+              className={inputCls}
+              value={category}
+              onChange={(e) => setCategory(e.target.value)}
             >
-              <h2 className="text-lg font-bold text-[#3B0718]">Set Budget</h2>
-              <div className="mt-3 grid grid-cols-3 gap-3">
-                <input
-                  type="number"
-                  min="0"
-                  step="0.01"
-                  value={budgetInput}
-                  onChange={(e) => setBudgetInput(e.target.value)}
-                  placeholder="Budget"
-                  className={`${inputCls} col-span-2`}
-                />
-                <select
-                  value={currency}
-                  onChange={(e) => setCurrency(e.target.value)}
-                  className={inputCls}
-                >
-                  {["PKR", "USD", "EUR", "GBP", "AED", "SAR"].map((c) => (
-                    <option key={c} value={c}>
-                      {c}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <button
-                type="submit"
-                className="mt-3 rounded-lg border border-[#D4AF37] bg-[#3B0718] px-4 py-2 font-semibold text-white hover:text-[#D4AF37]"
+              {CATEGORIES.map((c) => (
+                <option key={c.value} value={c.value}>
+                  {c.icon} {c.label}
+                </option>
+              ))}
+            </select>
+
+            <input
+              className={inputCls}
+              type="number"
+              min="0"
+              step="any"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              placeholder={`Amount (${currency})`}
+              required
+            />
+
+            <input
+              className={inputCls}
+              type="date"
+              value={expenseDate}
+              onChange={(e) => setExpenseDate(e.target.value)}
+              required
+            />
+
+            <input
+              className={inputCls}
+              type="text"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="Kis cheez par kharcha?"
+              maxLength={100}
+              required
+            />
+          </div>
+
+          <button
+            type="submit"
+            disabled={adding}
+            className="mt-4 rounded-xl border border-[#D4AF37] bg-[#3B0718] px-6 py-3 font-bold text-white hover:text-[#D4AF37] disabled:opacity-60"
+          >
+            {adding ? "Adding..." : "Add Expense"}
+          </button>
+        </form>
+      </section>
+
+      {/* Hotel bookings jinka kharcha add nahi hua */}
+      {pendingBookings.length > 0 && (
+        <section className="mt-6 rounded-2xl border border-[#D4AF37] bg-[#FFF8E5] p-5 sm:p-6">
+          <h2 className="text-xl font-extrabold text-[#3B0718]">
+            Hotel bookings se kharcha add karein
+          </h2>
+          <div className="mt-4 grid gap-3">
+            {pendingBookings.map((b) => (
+              <div
+                key={b.id}
+                className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#D4AF37]/50 bg-white p-4"
               >
-                Save Budget
-              </button>
-            </form>
-
-            <form
-              onSubmit={saveExpense}
-              className="rounded-2xl border border-[#D4AF37]/60 p-5"
-            >
-              <h2 className="text-lg font-bold text-[#3B0718]">
-                {editingId ? "Edit Expense" : "Add Expense"}
-              </h2>
-              <div className="mt-3 grid grid-cols-2 gap-3">
-                <select
-                  value={form.category}
-                  onChange={(e) => setForm({ ...form, category: e.target.value })}
-                  className={inputCls}
-                >
-                  {CATEGORIES.map((c) => (
-                    <option key={c.value} value={c.value}>
-                      {c.label}
-                    </option>
-                  ))}
-                </select>
-                <input
-                  type="number"
-                  min="0"
-                  step="0.01"
-                  value={form.amount}
-                  onChange={(e) => setForm({ ...form, amount: e.target.value })}
-                  placeholder={`Amount (${currency})`}
-                  className={inputCls}
-                />
-                <input
-                  type="date"
-                  value={form.expenseDate}
-                  onChange={(e) =>
-                    setForm({ ...form, expenseDate: e.target.value })
-                  }
-                  className={inputCls}
-                />
-                <input
-                  type="text"
-                  value={form.description}
-                  onChange={(e) =>
-                    setForm({ ...form, description: e.target.value })
-                  }
-                  placeholder="Description"
-                  className={inputCls}
-                />
-              </div>
-              <div className="mt-3 flex gap-3">
+                <div>
+                  <p className="font-bold text-[#3B0718]">{b.hotelName}</p>
+                  <p className="text-sm text-gray-600">
+                    {b.checkIn} → {b.checkOut} · {b.nights} night
+                    {b.nights > 1 ? "s" : ""} · {b.reference}
+                  </p>
+                  <p className="text-sm font-semibold text-[#701C35]">
+                    {money(b.currency, b.totalPrice)}
+                  </p>
+                </div>
                 <button
-                  type="submit"
-                  disabled={saving}
-                  className="rounded-lg border border-[#D4AF37] bg-[#3B0718] px-4 py-2 font-semibold text-white hover:text-[#D4AF37] disabled:opacity-60"
+                  type="button"
+                  onClick={() => addFromBooking(b)}
+                  className="rounded-lg bg-[#3B0718] px-4 py-2 text-sm font-bold text-[#D4AF37] hover:bg-[#701C35]"
                 >
-                  {saving ? "Saving..." : editingId ? "Update" : "Add Expense"}
+                  Add as expense
                 </button>
-                {editingId && (
-                  <button
-                    type="button"
-                    onClick={cancelEdit}
-                    className="rounded-lg border border-gray-300 px-4 py-2 font-semibold text-gray-700"
-                  >
-                    Cancel
-                  </button>
-                )}
               </div>
-            </form>
+            ))}
           </div>
-
-          {expenses.length > 0 && (
-            <div className="mt-6 grid gap-6 lg:grid-cols-2">
-              <div className="rounded-2xl border border-[#D4AF37]/60 p-5">
-                <h2 className="text-lg font-bold text-[#3B0718]">
-                  Spending by category
-                </h2>
-                <div className="mt-3 h-72">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <PieChart>
-                      <Pie
-                        data={pieData}
-                        dataKey="value"
-                        nameKey="name"
-                        outerRadius={95}
-                        label
-                      >
-                        {pieData.map((d) => (
-                          <Cell key={d.name} fill={d.color} />
-                        ))}
-                      </Pie>
-                      <Tooltip formatter={(v) => `${currency} ${money(v)}`} />
-                      <Legend />
-                    </PieChart>
-                  </ResponsiveContainer>
-                </div>
-              </div>
-
-              <div className="rounded-2xl border border-[#D4AF37]/60 p-5">
-                <h2 className="text-lg font-bold text-[#3B0718]">
-                  Daily spending
-                </h2>
-                <div className="mt-3 h-72">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={dayData}>
-                      <CartesianGrid strokeDasharray="3 3" />
-                      <XAxis dataKey="date" />
-                      <YAxis />
-                      <Tooltip formatter={(v) => `${currency} ${money(v)}`} />
-                      <Bar dataKey="total" fill="#D4AF37" />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
-              </div>
-            </div>
-          )}
-
-          <div className="mt-6 rounded-2xl border border-[#D4AF37]/60 p-5">
-            <h2 className="text-lg font-bold text-[#3B0718]">All expenses</h2>
-
-            {expenses.length === 0 ? (
-              <p className="mt-3 text-gray-600">
-                Abhi koi expense nahi. Upar form se pehla expense add karein.
-              </p>
-            ) : (
-              <div className="mt-3 overflow-x-auto">
-                <table className="w-full text-left text-sm">
-                  <thead>
-                    <tr className="border-b text-gray-500">
-                      <th className="py-2 pr-3">Date</th>
-                      <th className="py-2 pr-3">Category</th>
-                      <th className="py-2 pr-3">Description</th>
-                      <th className="py-2 pr-3 text-right">Amount</th>
-                      <th className="py-2" />
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {expenses.map((item) => (
-                      <tr key={item.id} className="border-b last:border-0">
-                        <td className="py-2 pr-3">{item.expenseDate}</td>
-                        <td className="py-2 pr-3">
-                          <span
-                            className="mr-2 inline-block h-2.5 w-2.5 rounded-full"
-                            style={{ background: colorOf(item.category) }}
-                          />
-                          {labelOf(item.category)}
-                        </td>
-                        <td className="py-2 pr-3">{item.description || "—"}</td>
-                        <td className="py-2 pr-3 text-right font-semibold">
-                          {item.currency} {money(item.amount)}
-                        </td>
-                        <td className="py-2 text-right">
-                          <button
-                            onClick={() => startEdit(item)}
-                            className="mr-3 font-semibold text-[#701C35] hover:underline"
-                          >
-                            Edit
-                          </button>
-                          <button
-                            onClick={() => removeExpense(item.id)}
-                            className="font-semibold text-red-700 hover:underline"
-                          >
-                            Delete
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </div>
-        </>
+        </section>
       )}
+
+      {/* Charts */}
+      {expenses.length > 0 && (
+        <section className="mt-6 grid gap-6 lg:grid-cols-2">
+          <div className="rounded-2xl border border-[#D4AF37]/60 bg-white p-5">
+            <h2 className="text-xl font-extrabold text-[#3B0718]">
+              Spending by category
+            </h2>
+            <p className="mt-1 text-sm text-gray-500">
+              Har rang ek category hai, % kul kharche ka hissa hai.
+            </p>
+
+            <div className="mt-4 h-64">
+              <ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie
+                    data={categoryData}
+                    dataKey="value"
+                    nameKey="name"
+                    outerRadius={95}
+                    innerRadius={45}
+                    paddingAngle={2}
+                    label={({ percent }) => `${Math.round(percent * 100)}%`}
+                  >
+                    {categoryData.map((row) => (
+                      <Cell key={row.key} fill={categoryColor(row.key)} />
+                    ))}
+                  </Pie>
+                  <Tooltip
+                    formatter={(value, name) => [money(currency, value), name]}
+                  />
+                </PieChart>
+              </ResponsiveContainer>
+            </div>
+
+            <ul className="mt-4 grid gap-2">
+              {categoryData.map((row) => {
+                const share =
+                  totalSpent > 0 ? Math.round((row.value / totalSpent) * 100) : 0;
+                return (
+                  <li
+                    key={row.key}
+                    className="flex items-center justify-between gap-3 rounded-lg bg-[#FFFDF8] px-3 py-2 text-sm"
+                  >
+                    <span className="flex items-center gap-2 text-gray-800">
+                      <span
+                        className="h-3 w-3 rounded-full"
+                        style={{ backgroundColor: categoryColor(row.key) }}
+                      />
+                      {categoryInfo(row.key).icon} {row.name}
+                    </span>
+                    <span className="font-semibold text-[#3B0718]">
+                      {money(currency, row.value)} · {share}%
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+
+          <div className="rounded-2xl border border-[#D4AF37]/60 bg-white p-5">
+            <h2 className="text-xl font-extrabold text-[#3B0718]">
+              Daily spending
+            </h2>
+            <p className="mt-1 text-sm text-gray-500">
+              Har din kitna kharcha hua ({currency}).
+            </p>
+
+            <div className="mt-4 h-72">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart
+                  data={dayData}
+                  margin={{ top: 24, right: 8, left: 0, bottom: 0 }}
+                >
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                  <XAxis
+                    dataKey="date"
+                    tickFormatter={shortDate}
+                    tick={{ fontSize: 12 }}
+                  />
+                  <YAxis tickFormatter={compactNumber} tick={{ fontSize: 12 }} />
+                  <Tooltip
+                    labelFormatter={shortDate}
+                    formatter={(value) => [money(currency, value), "Spent"]}
+                  />
+                  <Bar
+                    dataKey="total"
+                    fill="#D4AF37"
+                    radius={[8, 8, 0, 0]}
+                    maxBarSize={70}
+                  >
+                    <LabelList
+                      dataKey="total"
+                      position="top"
+                      formatter={compactNumber}
+                      style={{ fontSize: 12, fill: "#3B0718", fontWeight: 700 }}
+                    />
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {/* All expenses */}
+      <section className="mt-6 rounded-2xl border border-[#D4AF37]/60 bg-[#FFFDF8] p-5 sm:p-6">
+        <h2 className="text-2xl font-extrabold text-[#3B0718]">
+          All expenses
+        </h2>
+
+        {loading && (
+          <p className="mt-4 text-sm text-gray-600">Loading...</p>
+        )}
+
+        {!loading && expenses.length === 0 && (
+          <p className="mt-4 text-gray-600">
+            Abhi koi expense nahi. Upar form se pehla expense add karein.
+          </p>
+        )}
+
+        {expenses.length > 0 && (
+          <div className="mt-4 grid gap-3">
+            {expenses.map((item) => {
+              const info = categoryInfo(item.category);
+              return (
+                <div
+                  key={item.id}
+                  className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-gray-200 border-l-4 bg-white p-4"
+                  style={{ borderLeftColor: info.color }}
+                >
+                  <div>
+                    <p className="font-bold text-[#3B0718]">{item.title}</p>
+                    <p className="mt-1 flex flex-wrap items-center gap-2 text-sm text-gray-600">
+                      <span>{item.expenseDate}</span>
+                      <span
+                        className="rounded-full px-2 py-0.5 text-xs font-bold"
+                        style={{
+                          backgroundColor: `${info.color}1A`,
+                          color: info.color,
+                          border: `1px solid ${info.color}`,
+                        }}
+                      >
+                        {info.icon} {info.label}
+                      </span>
+                      {item.bookingId && (
+                        <span className="text-xs text-[#701C35]">
+                          (hotel booking)
+                        </span>
+                      )}
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    <p className="text-lg font-extrabold text-[#701C35]">
+                      {money(currency, item.amount)}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => deleteExpense(item)}
+                      className="rounded-lg border border-red-300 bg-white px-3 py-1 text-sm font-bold text-red-700 hover:bg-red-50"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
     </div>
   );
 }
