@@ -5,6 +5,7 @@ import Home from "./pages/Home";
 import Explore from "./pages/Explore";
 import TripPlanner from "./pages/TripPlanner";
 import ItineraryEditor from "./pages/ItineraryEditor";
+import AiPlanner from "./pages/AiPlanner";
 import Hotels from "./pages/Hotels";
 import MapPage from "./pages/MapPage";
 import Expenses from "./pages/Expenses";
@@ -21,6 +22,7 @@ export default function App() {
           <Route path="/explore" element={<Explore />} />
           <Route path="/planner" element={<TripPlanner />} />
           <Route path="/trips/:id/itinerary" element={<ItineraryEditor />} />
+          <Route path="/trips/:id/ai-planner" element={<AiPlanner />} />
           <Route path="/hotels" element={<Hotels />} />
           <Route path="/bookings" element={<Bookings />} />
           <Route path="/map" element={<MapPage />} />

@@ -406,6 +406,13 @@ export default function TripPlanner() {
                       ✦ Plan Itinerary
                     </Link>
 
+                    <Link
+                      to={`/trips/${trip.id}/ai-planner`}
+                      className="rounded-xl border border-[#D4AF37] bg-[#F7EAC0] px-4 py-2 text-center font-semibold text-[#3B0718] transition hover:bg-[#D4AF37]"
+                    >
+                      ✨ AI Planner
+                    </Link>
+
                     <button
                       type="button"
                       onClick={() => handleDelete(trip.id)}

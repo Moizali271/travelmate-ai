@@ -53,6 +53,9 @@ async def lifespan(app: FastAPI):
     except OperationFailure:
         pass
 
+    # AI usage ki roz ki limit ke liye index
+    await db.ai_usage.create_index([("userId", 1), ("createdAt", -1)])
+
     # OAuth index
     try:
         await db.users.drop_index(
@@ -108,6 +111,14 @@ app.include_router(routes.router)
 app.include_router(hotels.router)
 app.include_router(bookings.router)
 app.include_router(expenses.router)
+
+# AI planner: file kharab ho to baaki app phir bhi chalti rahe
+try:
+    from app.routers import ai_planner
+
+    app.include_router(ai_planner.router)
+except Exception as exc:
+    print(f"AI planner load nahi hua: {exc!r}")
 
 
 @app.get("/api/health")
