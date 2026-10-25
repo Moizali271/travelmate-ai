@@ -1,5 +1,5 @@
 import math
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Literal, Optional
 
 import httpx
@@ -81,9 +81,21 @@ def haversine_km(lat1, lon1, lat2, lon2) -> float:
     return 2 * r * math.asin(math.sqrt(a))
 
 
+def has_coords(stop: dict) -> bool:
+    return isinstance(stop.get("lat"), (int, float)) and isinstance(
+        stop.get("lon"), (int, float)
+    )
+
+
 def trip_days(trip: dict) -> tuple[int, date]:
-    start = date.fromisoformat(str(trip["startDate"])[:10])
-    end = date.fromisoformat(str(trip["endDate"])[:10])
+    try:
+        start = date.fromisoformat(str(trip["startDate"])[:10])
+        end = date.fromisoformat(str(trip["endDate"])[:10])
+    except (KeyError, ValueError, TypeError):
+        raise HTTPException(
+            status_code=400,
+            detail="Trip ki dates sahi nahi hain, pehle dates theek karein",
+        )
     return max((end - start).days + 1, 1), start
 
 
@@ -147,12 +159,16 @@ async def add_stop_by_name(
             status_code=400, detail=f"Is trip mein sirf {n_days} din hain"
         )
 
+    name = body.name.strip()
+    if len(name) < 2:
+        raise HTTPException(status_code=400, detail="Jagah ka naam likhein")
+
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             res = await client.get(
                 NOMINATIM_URL,
                 params={
-                    "q": body.name.strip(),
+                    "q": name,
                     "format": "json",
                     "limit": 1,
                     "accept-language": "en",
@@ -164,21 +180,40 @@ async def add_stop_by_name(
             status_code=502, detail="Location service se rabta nahi ho saka"
         )
 
+    if res.status_code == 429:
+        raise HTTPException(
+            status_code=502,
+            detail="Location service par bohat requests hain, thori der baad try karein",
+        )
     if res.status_code != 200:
         raise HTTPException(status_code=502, detail="Location service available nahi")
 
-    data = res.json()
-    if not data:
+    try:
+        data = res.json()
+    except ValueError:
+        raise HTTPException(
+            status_code=502, detail="Location service ka jawab samajh nahi aaya"
+        )
+
+    if not isinstance(data, list) or not data:
         raise HTTPException(status_code=404, detail="Yeh jagah nahi mili")
 
     item = data[0]
+    try:
+        lat = float(item["lat"])
+        lon = float(item["lon"])
+    except (KeyError, ValueError, TypeError):
+        raise HTTPException(
+            status_code=502, detail="Location service ka jawab adhoora hai"
+        )
+
     place_id = f"osm:{item.get('osm_type', 'x')}/{item.get('osm_id', '0')}"
 
     doc = {
         "placeId": place_id,
-        "name": body.name.strip(),
-        "lat": float(item["lat"]),
-        "lon": float(item["lon"]),
+        "name": name,
+        "lat": lat,
+        "lon": lon,
         "category": str(item.get("type", "")),
         "photoUrl": None,
         "wikiUrl": None,
@@ -241,7 +276,7 @@ async def reorder_stops(
 
     ops = [
         UpdateOne(
-            {"_id": oid},
+            {"_id": oid, "tripId": trip_id, "userId": user["id"]},
             {"$set": {"dayNumber": item.dayNumber, "stopOrder": item.stopOrder}},
         )
         for oid, item in zip(ids, body.items)
@@ -260,6 +295,8 @@ async def update_stop(
 ):
     await get_own_trip(trip_id, user)
     data = changes.model_dump(exclude_unset=True)
+    # null bhejne par koi field khali na ho jaye
+    data = {k: v for k, v in data.items() if v is not None}
     if not data:
         raise HTTPException(status_code=400, detail="No changes provided")
 
@@ -270,7 +307,11 @@ async def update_stop(
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Stop not found")
 
-    doc = await db.itinerary_stops.find_one({"_id": oid})
+    doc = await db.itinerary_stops.find_one(
+        {"_id": oid, "tripId": trip_id, "userId": user["id"]}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Stop not found")
     return with_defaults(serialize(doc))
 
 
@@ -302,7 +343,10 @@ async def get_itinerary(trip_id: str, user: dict = Depends(get_current_user)):
 
     by_day: dict[int, list] = {n: [] for n in range(1, n_days + 1)}
     for stop in stops:
-        day = min(max(int(stop["dayNumber"]), 1), n_days)
+        try:
+            day = min(max(int(stop["dayNumber"]), 1), n_days)
+        except (TypeError, ValueError):
+            day = 1
         by_day[day].append(stop)
 
     days = []
@@ -316,13 +360,14 @@ async def get_itinerary(trip_id: str, user: dict = Depends(get_current_user)):
 
         distance = 0.0
         for a, b in zip(day_stops, day_stops[1:]):
-            distance += haversine_km(a["lat"], a["lon"], b["lat"], b["lon"])
+            if has_coords(a) and has_coords(b):
+                distance += haversine_km(a["lat"], a["lon"], b["lat"], b["lon"])
         distance = round(distance * ROAD_FACTOR, 1)
         travel_minutes = round(distance / AVG_SPEED_KMH * 60)
 
         day_cost = sum(float(s["cost"] or 0) for s in day_stops)
         for s in day_stops:
-            kind = s["costType"]
+            kind = s["costType"] or "other"
             by_category[kind] = by_category.get(kind, 0.0) + float(s["cost"] or 0)
 
         total_distance += distance
@@ -332,7 +377,7 @@ async def get_itinerary(trip_id: str, user: dict = Depends(get_current_user)):
         days.append(
             {
                 "dayNumber": number,
-                "date": (start.fromordinal(start.toordinal() + number - 1)).isoformat(),
+                "date": (start + timedelta(days=number - 1)).isoformat(),
                 "stops": day_stops,
                 "distanceKm": distance,
                 "travelMinutes": travel_minutes,

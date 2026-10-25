@@ -9,6 +9,7 @@ Endpoints:
   DELETE /api/bookings/{booking_id}         -> delete (cancelled only)
 """
 
+import re
 import secrets
 from datetime import date, datetime, timezone
 from typing import Any, Optional
@@ -16,73 +17,53 @@ from typing import Any, Optional
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-# ---------------------------------------------------------------------------
-# Project imports (with fallbacks so small naming differences don't crash)
-# ---------------------------------------------------------------------------
-try:
-    from app.db import db
-except ImportError:  # pragma: no cover
-    from app import db as _db_module
-
-    db = getattr(_db_module, "db", None) or getattr(_db_module, "database")
-
-try:
-    from app.auth import get_current_user
-except ImportError:  # pragma: no cover
-    try:
-        from app.auth import get_current_active_user as get_current_user
-    except ImportError:
-        from app.auth import current_user as get_current_user
+from app.auth import get_current_user
+from app.db import db
 
 router = APIRouter(prefix="/api/bookings", tags=["Bookings"])
 
 ACTIVE_STATUSES = ["requested", "confirmed"]
+MAX_NIGHTS = 30
+PHONE_RE = re.compile(r"^[0-9+\-\s()]{7,20}$")
 
 
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
 class BookingCreate(BaseModel):
-    tripId: Optional[str] = None
-    hotelId: Optional[str] = None
-    hotelName: str
-    hotelType: Optional[str] = None
-    stars: Optional[float] = None
-    lat: Optional[float] = None
-    lon: Optional[float] = None
-    address: Optional[str] = None
-    destination: Optional[str] = None
-    checkIn: str
-    checkOut: str
-    guests: int = 1
-    rooms: int = 1
-    guestName: Optional[str] = None
-    phone: Optional[str] = None
-    notes: Optional[str] = None
-    pricePerNight: Optional[float] = None
-    currency: Optional[str] = "PKR"
+    tripId: Optional[str] = Field(default=None, max_length=50)
+    hotelId: Optional[str] = Field(default=None, max_length=100)
+    hotelName: str = Field(min_length=1, max_length=200)
+    hotelType: Optional[str] = Field(default=None, max_length=50)
+    stars: Optional[float] = Field(default=None, ge=0, le=5)
+    lat: Optional[float] = Field(default=None, ge=-90, le=90)
+    lon: Optional[float] = Field(default=None, ge=-180, le=180)
+    address: Optional[str] = Field(default=None, max_length=300)
+    destination: Optional[str] = Field(default=None, max_length=100)
+    checkIn: str = Field(max_length=30)
+    checkOut: str = Field(max_length=30)
+    guests: int = Field(default=1, ge=1, le=10)
+    rooms: int = Field(default=1, ge=1, le=5)
+    guestName: Optional[str] = Field(default=None, max_length=100)
+    phone: Optional[str] = Field(default=None, max_length=20)
+    notes: Optional[str] = Field(default=None, max_length=500)
+    pricePerNight: Optional[float] = Field(default=None, ge=0, le=10_000_000)
+    currency: Optional[str] = Field(default="PKR", max_length=10)
 
 
 class ConfirmBody(BaseModel):
-    confirmationNumber: str
+    confirmationNumber: str = Field(max_length=50)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def _user_id(user: Any) -> str:
-    """Return the logged-in user's id as a string (works for dict or object)."""
-    if isinstance(user, dict):
-        value = user.get("_id") or user.get("id") or user.get("userId")
-    else:
-        value = (
-            getattr(user, "id", None)
-            or getattr(user, "_id", None)
-            or getattr(user, "userId", None)
-        )
-    if value is None:
+    """Return the logged-in user's id as a string."""
+    value = user.get("id") if isinstance(user, dict) else None
+    if not value:
         raise HTTPException(status_code=401, detail="Invalid user session")
     return str(value)
 
@@ -125,7 +106,14 @@ def _serialize(doc: dict) -> dict:
 
 
 def _to_dict(model: BaseModel) -> dict:
-    return model.model_dump() if hasattr(model, "model_dump") else model.dict()
+    return model.model_dump()
+
+
+def _clean(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
 
 
 async def _get_own_booking(booking_id: str, uid: str) -> dict:
@@ -144,15 +132,32 @@ async def _get_own_booking(booking_id: str, uid: str) -> dict:
 async def create_booking(payload: BookingCreate, user=Depends(get_current_user)):
     uid = _user_id(user)
 
+    hotel_name = payload.hotelName.strip()
+    if not hotel_name:
+        raise HTTPException(status_code=400, detail="Hotel name is required")
+
     check_in = _parse_date(payload.checkIn, "checkIn")
     check_out = _parse_date(payload.checkOut, "checkOut")
+    if check_in < date.today():
+        raise HTTPException(status_code=400, detail="Check-in cannot be in the past")
     if check_out <= check_in:
         raise HTTPException(
             status_code=400, detail="Check-out must be after check-in"
         )
-    if payload.guests < 1 or payload.rooms < 1:
+    nights = (check_out - check_in).days
+    if nights > MAX_NIGHTS:
         raise HTTPException(
-            status_code=400, detail="Guests and rooms must be at least 1"
+            status_code=400, detail=f"Maximum {MAX_NIGHTS} nights per booking"
+        )
+
+    phone = _clean(payload.phone)
+    if phone and not PHONE_RE.match(phone):
+        raise HTTPException(status_code=400, detail="Phone number is not valid")
+
+    guest_name = _clean(payload.guestName)
+    if guest_name is not None and len(guest_name) < 2:
+        raise HTTPException(
+            status_code=400, detail="Guest name must be at least 2 characters"
         )
 
     # If a trip is given, it must belong to this user
@@ -186,16 +191,22 @@ async def create_booking(payload: BookingCreate, user=Depends(get_current_user))
                 detail="You already have an active booking for this hotel on these dates",
             )
 
-    nights = (check_out - check_in).days
     total_price = None
     if payload.pricePerNight is not None:
         total_price = round(payload.pricePerNight * nights * payload.rooms, 2)
+
+    currency = (payload.currency or "PKR").strip().upper() or "PKR"
 
     now = datetime.now(timezone.utc)
     doc = _to_dict(payload)
     doc.update(
         {
             "userId": uid,
+            "hotelName": hotel_name,
+            "guestName": guest_name,
+            "phone": phone,
+            "notes": _clean(payload.notes),
+            "currency": currency,
             "checkIn": check_in_str,
             "checkOut": check_out_str,
             "nights": nights,
@@ -218,7 +229,7 @@ async def create_booking(payload: BookingCreate, user=Depends(get_current_user))
 # ---------------------------------------------------------------------------
 @router.get("")
 async def list_bookings(
-    status: Optional[str] = Query(default=None),
+    status: Optional[str] = Query(default=None, max_length=20),
     user=Depends(get_current_user),
 ):
     uid = _user_id(user)
@@ -244,56 +255,76 @@ async def get_booking(booking_id: str, user=Depends(get_current_user)):
 async def confirm_booking(
     booking_id: str, body: ConfirmBody, user=Depends(get_current_user)
 ):
-    booking = await _get_own_booking(booking_id, _user_id(user))
+    uid = _user_id(user)
+    booking = await _get_own_booking(booking_id, uid)
 
     if booking.get("status") == "cancelled":
         raise HTTPException(
             status_code=400, detail="Cancelled booking cannot be confirmed"
         )
 
+    confirmation = body.confirmationNumber.strip()
+    if not confirmation:
+        raise HTTPException(
+            status_code=400, detail="Confirmation number is required"
+        )
+
     await db.bookings.update_one(
-        {"_id": booking["_id"]},
+        {"_id": booking["_id"], "userId": {"$in": _user_id_variants(uid)}},
         {
             "$set": {
                 "status": "confirmed",
-                "confirmationNumber": body.confirmationNumber,
+                "confirmationNumber": confirmation,
                 "updatedAt": datetime.now(timezone.utc),
             }
         },
     )
-    updated = await db.bookings.find_one({"_id": booking["_id"]})
+    updated = await db.bookings.find_one(
+        {"_id": booking["_id"], "userId": {"$in": _user_id_variants(uid)}}
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Booking not found")
     return _serialize(updated)
 
 
 @router.patch("/{booking_id}/cancel")
 async def cancel_booking(booking_id: str, user=Depends(get_current_user)):
-    booking = await _get_own_booking(booking_id, _user_id(user))
+    uid = _user_id(user)
+    booking = await _get_own_booking(booking_id, uid)
 
     if booking.get("status") == "cancelled":
         raise HTTPException(status_code=400, detail="Booking is already cancelled")
 
+    now = datetime.now(timezone.utc)
     await db.bookings.update_one(
-        {"_id": booking["_id"]},
+        {"_id": booking["_id"], "userId": {"$in": _user_id_variants(uid)}},
         {
             "$set": {
                 "status": "cancelled",
-                "cancelledAt": datetime.now(timezone.utc),
-                "updatedAt": datetime.now(timezone.utc),
+                "cancelledAt": now,
+                "updatedAt": now,
             }
         },
     )
-    updated = await db.bookings.find_one({"_id": booking["_id"]})
+    updated = await db.bookings.find_one(
+        {"_id": booking["_id"], "userId": {"$in": _user_id_variants(uid)}}
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Booking not found")
     return _serialize(updated)
 
 
 @router.delete("/{booking_id}")
 async def delete_booking(booking_id: str, user=Depends(get_current_user)):
-    booking = await _get_own_booking(booking_id, _user_id(user))
+    uid = _user_id(user)
+    booking = await _get_own_booking(booking_id, uid)
 
     if booking.get("status") != "cancelled":
         raise HTTPException(
             status_code=400, detail="Only cancelled bookings can be deleted"
         )
 
-    await db.bookings.delete_one({"_id": booking["_id"]})
+    await db.bookings.delete_one(
+        {"_id": booking["_id"], "userId": {"$in": _user_id_variants(uid)}}
+    )
     return {"deleted": True, "id": booking_id}

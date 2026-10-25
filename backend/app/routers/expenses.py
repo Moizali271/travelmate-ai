@@ -27,9 +27,17 @@ class ExpenseCreate(BaseModel):
     expenseDate: date
     notes: str = Field(default="", max_length=300)
 
-    @field_validator("title", "notes")
+    @field_validator("title")
     @classmethod
-    def strip_text(cls, value):
+    def clean_title(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("Title khali nahi ho sakta")
+        return value
+
+    @field_validator("notes")
+    @classmethod
+    def clean_notes(cls, value):
         return value.strip()
 
 
@@ -39,6 +47,21 @@ class ExpenseUpdate(BaseModel):
     amount: Optional[float] = Field(default=None, gt=0, le=1_000_000_000)
     expenseDate: Optional[date] = None
     notes: Optional[str] = Field(default=None, max_length=300)
+
+    @field_validator("title")
+    @classmethod
+    def clean_title(cls, value):
+        if value is None:
+            return value
+        value = value.strip()
+        if not value:
+            raise ValueError("Title khali nahi ho sakta")
+        return value
+
+    @field_validator("notes")
+    @classmethod
+    def clean_notes(cls, value):
+        return value.strip() if value is not None else value
 
 
 class BudgetSet(BaseModel):
@@ -233,8 +256,18 @@ async def expense_from_booking(
         raise HTTPException(status_code=409, detail="Cancelled booking ka kharcha add nahi hota")
     if not booking.get("tripId"):
         raise HTTPException(status_code=400, detail="Is booking ko pehle kisi trip se jodein")
-    if booking.get("totalPrice") is None:
-        raise HTTPException(status_code=400, detail="Is booking mein price nahi likhi")
+
+    price = booking.get("totalPrice")
+    if (
+        isinstance(price, bool)
+        or not isinstance(price, (int, float))
+        or price <= 0
+    ):
+        raise HTTPException(status_code=400, detail="Is booking mein sahi price nahi likhi")
+
+    check_in = booking.get("checkIn")
+    if not check_in:
+        raise HTTPException(status_code=400, detail="Is booking mein check-in date nahi hai")
 
     trip = await get_own_trip(booking["tripId"], user)
     if booking.get("currency") != trip.get("currency"):
@@ -244,14 +277,17 @@ async def expense_from_booking(
         )
 
     now = datetime.now(timezone.utc)
-    nights = booking.get("nights", 1)
+    nights = booking.get("nights")
+    if not isinstance(nights, int) or nights < 1:
+        nights = 1
+    hotel_name = booking.get("hotelName") or "Hotel"
     data = {
         "tripId": booking["tripId"],
-        "title": f"{booking['hotelName']} ({nights} night{'s' if nights > 1 else ''})"[:100],
+        "title": f"{hotel_name} ({nights} night{'s' if nights > 1 else ''})"[:100],
         "category": "accommodation",
-        "amount": booking["totalPrice"],
-        "expenseDate": booking["checkIn"],
-        "notes": f"Booking {booking.get('reference', '')}",
+        "amount": price,
+        "expenseDate": check_in,
+        "notes": f"Booking {booking.get('reference', '')}"[:300],
         "userId": user["id"],
         "bookingId": booking_id,
         "createdAt": now,
@@ -277,6 +313,8 @@ async def update_expense(
 ):
     oid = to_object_id(expense_id, "expense id")
     update_data = changes.model_dump(mode="json", exclude_unset=True)
+    # null bhejne par koi field khali na ho jaye
+    update_data = {k: v for k, v in update_data.items() if v is not None}
     if not update_data:
         raise HTTPException(status_code=400, detail="No changes provided")
     update_data["updatedAt"] = datetime.now(timezone.utc)
@@ -287,7 +325,9 @@ async def update_expense(
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Expense not found")
 
-    doc = await db.expenses.find_one({"_id": oid})
+    doc = await db.expenses.find_one({"_id": oid, "userId": user["id"]})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Expense not found")
     return serialize(doc)
 
 

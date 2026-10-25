@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import math
 import os
 import re
@@ -21,6 +22,8 @@ from app.db import db
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/ai", tags=["ai-planner"])
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
@@ -30,6 +33,8 @@ MAX_DAYS = 7
 MAX_RADIUS_KM = 350
 ROAD_FACTOR = 1.3
 AVG_SPEED_KMH = 40
+MAX_STOPS_PER_TRIP = 150
+MAX_GEO_CACHE = 2000
 STOPS_PER_DAY = {"relaxed": 3, "balanced": 4, "packed": 5}
 
 CostType = Literal[
@@ -42,7 +47,7 @@ COST_TYPES = {"accommodation", "food", "transport", "activities", "shopping", "o
 # Request models
 # ---------------------------------------------------------------------------
 class SuggestBody(BaseModel):
-    tripId: str
+    tripId: str = Field(max_length=50)
     interests: list[str] = Field(default_factory=list, max_length=10)
     style: Literal["budget", "balanced", "comfort"] = "balanced"
     pace: Literal["relaxed", "balanced", "packed"] = "balanced"
@@ -69,7 +74,7 @@ class ApplyDay(BaseModel):
 
 
 class ApplyBody(BaseModel):
-    tripId: str
+    tripId: str = Field(max_length=50)
     days: list[ApplyDay] = Field(max_length=31)
     replace: bool = False
 
@@ -85,8 +90,14 @@ def to_object_id(value: str, label: str = "id") -> ObjectId:
 
 
 def trip_days(trip: dict) -> tuple[int, date]:
-    start = date.fromisoformat(str(trip["startDate"])[:10])
-    end = date.fromisoformat(str(trip["endDate"])[:10])
+    try:
+        start = date.fromisoformat(str(trip["startDate"])[:10])
+        end = date.fromisoformat(str(trip["endDate"])[:10])
+    except (KeyError, ValueError, TypeError):
+        raise HTTPException(
+            status_code=400,
+            detail="Trip ki dates sahi nahi hain, pehle dates theek karein",
+        )
     return max((end - start).days + 1, 1), start
 
 
@@ -122,6 +133,10 @@ def num(value, default: float = 0.0, lo: float = 0.0, hi: float = 1_000_000_000.
     if math.isnan(number) or math.isinf(number):
         return default
     return max(lo, min(hi, number))
+
+
+def as_list(value) -> list:
+    return value if isinstance(value, list) else []
 
 
 def parse_json_content(text: str) -> dict:
@@ -202,9 +217,10 @@ async def call_grok(messages: list[dict]) -> str:
     key = grok_key()
 
     if not provider or not key:
+        logger.error("AI API key set nahi hai (GEMINI_API_KEY ya GROK_API_KEY)")
         raise HTTPException(
             status_code=503,
-            detail="AI API key set nahi hai. backend/.env mein GEMINI_API_KEY (ya GROK_API_KEY) likhein.",
+            detail="AI planner abhi available nahi hai.",
         )
 
     label = PROVIDERS[provider]["label"]
@@ -221,16 +237,10 @@ async def call_grok(messages: list[dict]) -> str:
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
+    timeout = httpx.Timeout(connect=15, read=180, write=30, pool=15)
 
     for attempt in range(2):
         try:
-            timeout = httpx.Timeout(
-                connect=15,
-                read=180,
-                write=30,
-                pool=15,
-            )
-
             async with httpx.AsyncClient(timeout=timeout) as client:
                 res = await client.post(url, json=payload, headers=headers)
 
@@ -239,9 +249,7 @@ async def call_grok(messages: list[dict]) -> str:
                     res = await client.post(url, json=payload, headers=headers)
 
         except httpx.TimeoutException:
-            if attempt == 0:
-                await asyncio.sleep(1)
-                continue
+            # timeout par dobara try nahi, warna intezar aur paisa dono double
             raise HTTPException(
                 status_code=504,
                 detail=f"{label} ne 180 seconds mein jawab nahi diya. Dobara try karein.",
@@ -270,21 +278,24 @@ async def call_grok(messages: list[dict]) -> str:
             )
 
         if res.status_code == 401:
+            logger.error("%s API key ghalat hai", label)
             raise HTTPException(
                 status_code=502,
                 detail=f"{label} API key ghalat hai.",
             )
 
         if res.status_code in (402, 403):
+            logger.error("%s account/billing ka masla (%s)", label, res.status_code)
             raise HTTPException(
                 status_code=502,
-                detail=f"{label} account mein credits/access ka masla hai. Key aur billing check karein.",
+                detail=f"{label} account mein credits/access ka masla hai.",
             )
 
         if res.status_code == 404:
+            logger.error("%s model '%s' nahi mila", label, model)
             raise HTTPException(
                 status_code=502,
-                detail=f"{label} model '{model}' nahi mila. .env mein model check karein.",
+                detail=f"{label} ka model nahi mila. Server ki settings check karein.",
             )
 
         if res.status_code == 429:
@@ -297,9 +308,13 @@ async def call_grok(messages: list[dict]) -> str:
             await asyncio.sleep(1)
             continue
 
+        # provider ka asli error sirf server log mein, user ko nahi
+        logger.warning(
+            "%s error %s: %s", label, res.status_code, res.text[:300]
+        )
         raise HTTPException(
             status_code=502,
-            detail=f"{label} ne error diya ({res.status_code}): {res.text[:200]}",
+            detail=f"{label} ne error diya ({res.status_code}). Dobara try karein.",
         )
 
     raise HTTPException(
@@ -309,11 +324,14 @@ async def call_grok(messages: list[dict]) -> str:
 
 
 def build_messages(trip: dict, n_days: int, start: date, body: SuggestBody) -> list[dict]:
-    currency = trip.get("currency", "PKR")
+    currency = clean_text(trip.get("currency", "PKR"), 10) or "PKR"
     budget = float(trip.get("budget") or 0)
     travelers = int(trip.get("travelerCount") or 1)
+    destination = clean_text(trip.get("destination", ""), 100)
     max_stops = STOPS_PER_DAY[body.pace]
-    interests = ", ".join(clean_text(i, 40) for i in body.interests if i.strip())
+    interests = ", ".join(
+        clean_text(i, 40) for i in body.interests if clean_text(i, 40)
+    )
     notes = clean_text(body.notes, 500).replace('"', "'")
 
     system = (
@@ -324,7 +342,7 @@ def build_messages(trip: dict, n_days: int, start: date, body: SuggestBody) -> l
     )
 
     user = f"""Plan a {n_days}-day trip.
-Destination: {trip.get("destination", "")}
+Destination: {destination}
 Start date: {start.isoformat()}
 Travelers: {travelers}
 Total budget: {budget:.0f} {currency} (for the whole group)
@@ -378,6 +396,12 @@ _geo_lock = asyncio.Lock()
 _last_geo_call = 0.0
 
 
+def _cache_put(key: str, value) -> None:
+    if len(_geo_cache) >= MAX_GEO_CACHE:
+        _geo_cache.clear()
+    _geo_cache[key] = value
+
+
 async def geocode(client: httpx.AsyncClient, query: str) -> Optional[dict]:
     """Nominatim ki limit 1 request/second hai, isliye har call ke beech wait."""
     global _last_geo_call
@@ -413,39 +437,59 @@ async def geocode(client: httpx.AsyncClient, query: str) -> Optional[dict]:
     except ValueError:
         return None
 
+    if not isinstance(data, list):
+        return None
+
     if not data:
-        _geo_cache[key] = None
+        _cache_put(key, None)
         return None
 
     item = data[0]
-    found = {
-        "lat": float(item["lat"]),
-        "lon": float(item["lon"]),
-        "placeId": f"osm:{item.get('osm_type', 'x')}/{item.get('osm_id', '0')}",
-        "address": str(item.get("display_name", ""))[:150],
-        "type": str(item.get("type", "")),
-    }
-    _geo_cache[key] = found
+    try:
+        found = {
+            "lat": float(item["lat"]),
+            "lon": float(item["lon"]),
+            "placeId": f"osm:{item.get('osm_type', 'x')}/{item.get('osm_id', '0')}",
+            "address": str(item.get("display_name", ""))[:150],
+            "type": str(item.get("type", "")),
+        }
+    except (KeyError, ValueError, TypeError):
+        return None
+
+    _cache_put(key, found)
     return found
 
 
 # ---------------------------------------------------------------------------
 # Usage limit (API paisa leti hai, isliye roz ki hadd)
 # ---------------------------------------------------------------------------
-async def check_daily_limit(user_id: str):
+async def reserve_usage(user_id: str, trip_id: str):
+    """Pehle usage darj karo, phir ginti karo. Is tarah ek saath bohat requests
+    bhejne par bhi limit se zyada nahi guzar sakti."""
     try:
         limit = int(os.getenv("AI_DAILY_LIMIT", "10"))
     except ValueError:
         limit = 10
-    since = datetime.now(timezone.utc) - timedelta(hours=24)
-    used = await db.ai_usage.count_documents(
-        {"userId": user_id, "createdAt": {"$gte": since}}
+
+    now = datetime.now(timezone.utc)
+    inserted = await db.ai_usage.insert_one(
+        {
+            "userId": user_id,
+            "tripId": trip_id,
+            "model": grok_model(),
+            "createdAt": now,
+        }
     )
-    if used >= limit:
+    used = await db.ai_usage.count_documents(
+        {"userId": user_id, "createdAt": {"$gte": now - timedelta(hours=24)}}
+    )
+    if used > limit:
+        await db.ai_usage.delete_one({"_id": inserted.inserted_id})
         raise HTTPException(
             status_code=429,
             detail=f"Aaj ki AI limit ({limit} itineraries) poori ho gayi. Kal dobara try karein.",
         )
+    return inserted.inserted_id
 
 
 # ---------------------------------------------------------------------------
@@ -470,17 +514,14 @@ async def suggest_itinerary(body: SuggestBody, user: dict = Depends(get_current_
             detail=f"AI planner abhi zyada se zyada {MAX_DAYS} din ke liye hai. Trip ke din kam karein.",
         )
 
-    await check_daily_limit(user["id"])
+    usage_id = await reserve_usage(user["id"], body.tripId)
 
-    raw = await call_grok(build_messages(trip, n_days, start, body))
-    await db.ai_usage.insert_one(
-        {
-            "userId": user["id"],
-            "tripId": body.tripId,
-            "model": grok_model(),
-            "createdAt": datetime.now(timezone.utc),
-        }
-    )
+    try:
+        raw = await call_grok(build_messages(trip, n_days, start, body))
+    except Exception:
+        # AI call fail hui to is koshish ko limit mein na ginein
+        await db.ai_usage.delete_one({"_id": usage_id})
+        raise
 
     plan = parse_json_content(raw)
     raw_days = plan.get("days")
@@ -520,9 +561,7 @@ async def suggest_itinerary(body: SuggestBody, user: dict = Depends(get_current_
                 raw_day = {}
 
             stops: list[dict] = []
-            raw_stops = raw_day.get("stops")
-            if not isinstance(raw_stops, list):
-                raw_stops = []
+            raw_stops = as_list(raw_day.get("stops"))
 
             for raw_stop in raw_stops[:max_stops]:
                 if not isinstance(raw_stop, dict):
@@ -633,11 +672,11 @@ async def suggest_itinerary(body: SuggestBody, user: dict = Depends(get_current_
         )
 
     tips = [
-        clean_text(t, 200) for t in (plan.get("tips") or []) if isinstance(t, str)
+        clean_text(t, 200) for t in as_list(plan.get("tips")) if isinstance(t, str)
     ][:6]
     alternatives = [
         clean_text(a, 200)
-        for a in (plan.get("alternatives") or [])
+        for a in as_list(plan.get("alternatives"))
         if isinstance(a, str)
     ][:6]
 
@@ -691,6 +730,18 @@ async def apply_itinerary(body: ApplyBody, user: dict = Depends(get_current_user
             raise HTTPException(
                 status_code=400, detail=f"Is trip mein sirf {n_days} din hain"
             )
+
+    incoming = sum(len(day.stops) for day in body.days)
+    existing = 0
+    if not body.replace:
+        existing = await db.itinerary_stops.count_documents(
+            {"tripId": body.tripId, "userId": user["id"]}
+        )
+    if existing + incoming > MAX_STOPS_PER_TRIP:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Ek trip mein zyada se zyada {MAX_STOPS_PER_TRIP} stops ho sakte hain",
+        )
 
     if body.replace:
         await db.itinerary_stops.delete_many(

@@ -1,3 +1,4 @@
+import logging
 import os
 from datetime import datetime, timezone
 from typing import Optional
@@ -13,6 +14,8 @@ from app.db import db
 from app.schemas import RouteCalculate, RouteSave
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 ORS_API_KEY = os.getenv("ORS_API_KEY")
 ORS_URL = "https://api.openrouteservice.org/v2/directions/{profile}/geojson"
@@ -42,7 +45,10 @@ async def calculate_route(
     data: RouteCalculate, user: dict = Depends(get_current_user)
 ):
     if not ORS_API_KEY:
-        raise HTTPException(status_code=500, detail="ORS_API_KEY .env mein set nahi hai")
+        logger.error("ORS_API_KEY .env mein set nahi hai")
+        raise HTTPException(
+            status_code=503, detail="Routing service abhi available nahi hai"
+        )
 
     body = {
         "coordinates": [
@@ -66,24 +72,34 @@ async def calculate_route(
         try:
             err = res.json().get("error")
             if isinstance(err, dict):
-                detail = err.get("message", detail)
+                detail = str(err.get("message", detail))[:200]
             elif isinstance(err, str):
-                detail = err
-        except ValueError:
+                detail = err[:200]
+        except (ValueError, AttributeError):
             pass
         if res.status_code == 429:
             raise HTTPException(status_code=429, detail="Aaj ki routing limit poori ho gayi")
         code = 400 if res.status_code in (400, 404) else 502
         raise HTTPException(status_code=code, detail=detail)
 
-    feature = res.json()["features"][0]
-    summary = feature["properties"]["summary"]
+    try:
+        feature = res.json()["features"][0]
+        summary = feature["properties"]["summary"]
+        coordinates = feature["geometry"]["coordinates"]
+        distance = float(summary["distance"])
+        duration = float(summary["duration"])
+        # ORS [lon, lat] deta hai, Leaflet ko [lat, lon] chahiye
+        geometry = [[lat, lon] for lon, lat in coordinates]
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise HTTPException(
+            status_code=502, detail="Routing service ka jawab samajh nahi aaya"
+        )
+
     return {
         "mode": data.mode,
-        "distanceMeters": summary["distance"],
-        "durationSeconds": summary["duration"],
-        # ORS [lon, lat] deta hai, Leaflet ko [lat, lon] chahiye
-        "geometry": [[lat, lon] for lon, lat in feature["geometry"]["coordinates"]],
+        "distanceMeters": distance,
+        "durationSeconds": duration,
+        "geometry": geometry,
     }
 
 
@@ -109,6 +125,7 @@ async def list_saved_routes(
 ):
     query = {"userId": user["id"]}
     if tripId:
+        to_object_id(tripId, "trip id")
         query["tripId"] = tripId
     routes = []
     async for doc in db.routes.find(query).sort("createdAt", -1):

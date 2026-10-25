@@ -6,6 +6,7 @@ import bcrypt
 from bson import ObjectId
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException
+from google.auth.exceptions import GoogleAuthError, TransportError
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 from pydantic import BaseModel, Field
@@ -22,6 +23,7 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+MAX_PASSWORD_BYTES = 72  # bcrypt ki limit bytes mein hai, characters mein nahi
 
 
 class GoogleLoginIn(BaseModel):
@@ -35,13 +37,26 @@ class RegisterIn(BaseModel):
 
 
 class LoginIn(BaseModel):
-    email: str
-    password: str
+    email: str = Field(max_length=100)
+    password: str = Field(max_length=72)
 
 
 class ChangePasswordIn(BaseModel):
-    currentPassword: str
+    currentPassword: str = Field(max_length=72)
     newPassword: str = Field(min_length=6, max_length=72)
+
+
+def password_too_long(password: str) -> bool:
+    return len(password.encode("utf-8")) > MAX_PASSWORD_BYTES
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    if password_too_long(plain):
+        return False
+    try:
+        return bcrypt.checkpw(plain.encode(), hashed.encode())
+    except ValueError:
+        return False
 
 
 def public_user(u: dict) -> dict:
@@ -63,6 +78,12 @@ async def mark_login(user: dict):
 
 @router.post("/google")
 async def google_login(body: GoogleLoginIn):
+    # client id na ho to Google token ka audience check skip ho jata hai
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(
+            status_code=503, detail="Google login abhi configure nahi hai"
+        )
+
     try:
         info = await run_in_threadpool(
             id_token.verify_oauth2_token,
@@ -70,15 +91,37 @@ async def google_login(body: GoogleLoginIn):
             google_requests.Request(),
             GOOGLE_CLIENT_ID,
         )
-    except ValueError:
+    except TransportError:
+        raise HTTPException(
+            status_code=503, detail="Google se rabta nahi ho saka, dobara koshish karein"
+        )
+    except (ValueError, GoogleAuthError):
         raise HTTPException(status_code=401, detail="Google token ghalat hai")
+
+    if not info.get("email_verified"):
+        raise HTTPException(status_code=401, detail="Google email verified nahi hai")
+
+    email = info.get("email", "").lower()
+
+    # agar yeh Google account pehli baar aa raha hai aur email pehle se
+    # password account ke saath registered hai, to dusra user mat banao
+    google_user = await db.users.find_one(
+        {"oauthProvider": "google", "oauthSubject": info["sub"]}
+    )
+    if not google_user:
+        clash = await db.users.find_one({"email": email})
+        if clash:
+            raise HTTPException(
+                status_code=400,
+                detail="Yeh email pehle se email/password se registered hai, usi se login karein",
+            )
 
     user = await db.users.find_one_and_update(
         {"oauthProvider": "google", "oauthSubject": info["sub"]},
         {
             "$set": {
                 "name": info.get("name", ""),
-                "email": info.get("email", "").lower(),
+                "email": email,
                 "picture": info.get("picture", ""),
             },
             "$setOnInsert": {"createdAt": datetime.now(timezone.utc)},
@@ -96,6 +139,11 @@ async def register(body: RegisterIn):
     email = body.email.strip().lower()
     if not EMAIL_RE.match(email):
         raise HTTPException(status_code=400, detail="Sahi email likhein")
+
+    if password_too_long(body.password):
+        raise HTTPException(
+            status_code=400, detail="Password bohat lamba hai, chhota rakhein"
+        )
 
     existing = await db.users.find_one({"email": email})
     if existing:
@@ -130,9 +178,7 @@ async def login(body: LoginIn):
             status_code=401, detail="Is email ke liye Google se login karein"
         )
 
-    ok = user and bcrypt.checkpw(
-        body.password.encode(), user["password_hash"].encode()
-    )
+    ok = bool(user) and verify_password(body.password, user["password_hash"])
     if not ok:
         await log_activity(None, "login_failed", {"email": email})
         raise HTTPException(status_code=401, detail="Email ya password ghalat hai")
@@ -160,10 +206,13 @@ async def change_password(
             detail="Aap Google se login hain, is account ka password yahan change nahi hota",
         )
 
-    if not bcrypt.checkpw(
-        body.currentPassword.encode(), doc["password_hash"].encode()
-    ):
+    if not verify_password(body.currentPassword, doc["password_hash"]):
         raise HTTPException(status_code=400, detail="Purana password ghalat hai")
+
+    if password_too_long(body.newPassword):
+        raise HTTPException(
+            status_code=400, detail="Naya password bohat lamba hai, chhota rakhein"
+        )
 
     if body.currentPassword == body.newPassword:
         raise HTTPException(

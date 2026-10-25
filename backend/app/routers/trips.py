@@ -59,15 +59,35 @@ async def update_trip(
 ):
     oid = to_object_id(trip_id)
     update_data = changes.model_dump(mode="json", exclude_unset=True)
+    # owner fields kabhi client se change nahi hone chahiye
+    for protected in ("id", "_id", "userId", "createdAt"):
+        update_data.pop(protected, None)
+    # null bhejne par koi field khali na ho jaye
+    update_data = {k: v for k, v in update_data.items() if v is not None}
     if not update_data:
         raise HTTPException(status_code=400, detail="No changes provided")
+
+    existing = await db.trips.find_one({"_id": oid, "userId": user["id"]})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Trip not found")
+
+    # sirf ek date badli ho to purani date ke saath compare karo
+    if "startDate" in update_data or "endDate" in update_data:
+        new_start = str(update_data.get("startDate", existing.get("startDate")))[:10]
+        new_end = str(update_data.get("endDate", existing.get("endDate")))[:10]
+        if new_end < new_start:
+            raise HTTPException(
+                status_code=400,
+                detail="endDate, startDate se pehle nahi ho sakti",
+            )
+
     update_data["updatedAt"] = datetime.now(timezone.utc)
-    result = await db.trips.update_one(
+    await db.trips.update_one(
         {"_id": oid, "userId": user["id"]}, {"$set": update_data}
     )
-    if result.matched_count == 0:
+    doc = await db.trips.find_one({"_id": oid, "userId": user["id"]})
+    if not doc:
         raise HTTPException(status_code=404, detail="Trip not found")
-    doc = await db.trips.find_one({"_id": oid})
     return serialize(doc)
 
 
