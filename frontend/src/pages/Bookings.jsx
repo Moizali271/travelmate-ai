@@ -1,8 +1,10 @@
-
 import { useCallback, useEffect, useState } from "react";
 
 const API_URL =
   import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+
+const SESSION_EXPIRED = "Login session expire ho gayi. Dobara login karein.";
+const SERVER_DOWN = "Server se rabta nahi ho saka. Internet ya backend check karein.";
 
 function getToken() {
   return (
@@ -14,6 +16,32 @@ function getToken() {
 function formatDate(value) {
   if (!value) return "—";
   return String(value).slice(0, 10);
+}
+
+// Backend ka "detail" string ho ya FastAPI validation ki list, dono ko saaf message banata hai
+function detailToMessage(detail, fallback) {
+  if (typeof detail === "string" && detail.trim()) return detail;
+
+  if (Array.isArray(detail) && detail.length > 0) {
+    const text = detail
+      .map((item) => String(item?.msg || "").replace(/^Value error,\s*/i, ""))
+      .filter(Boolean)
+      .join(". ");
+    if (text) return text;
+  }
+
+  return fallback;
+}
+
+async function readError(response, fallback) {
+  const body = await response.json().catch(() => ({}));
+  return detailToMessage(body?.detail, fallback);
+}
+
+// fetch ka network error (backend band / internet nahi) TypeError hota hai
+function friendlyError(err, fallback) {
+  if (err instanceof TypeError) return SERVER_DOWN;
+  return err?.message || fallback;
 }
 
 export default function Bookings() {
@@ -42,15 +70,17 @@ export default function Bookings() {
 
       if (!response.ok) {
         if (response.status === 401 || response.status === 403) {
-          throw new Error("Login session expire ho gayi. Dobara login karein.");
+          throw new Error(SESSION_EXPIRED);
         }
-        throw new Error("Bookings load nahi ho sakin.");
+        throw new Error(
+          await readError(response, "Bookings load nahi ho sakin.")
+        );
       }
 
       const data = await response.json();
       setBookings(Array.isArray(data) ? data : []);
     } catch (err) {
-      setError(err.message || "Backend se connection nahi ho saka.");
+      setError(friendlyError(err, "Bookings load nahi ho sakin."));
     } finally {
       setLoading(false);
     }
@@ -67,6 +97,12 @@ export default function Bookings() {
 
     if (!confirmed) return;
 
+    const token = getToken();
+    if (!token) {
+      setError("Login session nahi mili. Please log in again.");
+      return;
+    }
+
     setActionId(id);
     setError("");
 
@@ -76,19 +112,23 @@ export default function Bookings() {
         {
           method: "PATCH",
           headers: {
-            Authorization: `Bearer ${getToken()}`,
+            Authorization: `Bearer ${token}`,
           },
         }
       );
 
       if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        throw new Error(body.detail || "Booking cancel nahi ho saki.");
+        if (response.status === 401) {
+          throw new Error(SESSION_EXPIRED);
+        }
+        throw new Error(
+          await readError(response, "Booking cancel nahi ho saki.")
+        );
       }
 
       await loadBookings();
     } catch (err) {
-      setError(err.message || "Booking cancel nahi ho saki.");
+      setError(friendlyError(err, "Booking cancel nahi ho saki."));
     } finally {
       setActionId("");
     }

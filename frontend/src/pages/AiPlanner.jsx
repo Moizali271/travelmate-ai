@@ -1,4 +1,3 @@
-
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { authFetch } from "../services/authFetch";
@@ -53,12 +52,25 @@ function money(n) {
   });
 }
 
+function clampNumber(value, min, max, integer = false) {
+  let n = Number(value);
+  if (!Number.isFinite(n)) n = 0;
+  n = Math.min(max, Math.max(min, n));
+  return integer ? Math.round(n) : n;
+}
+
 async function readError(res, fallback) {
   const data = await res.json().catch(() => null);
+  const raw = data?.detail;
 
-  const detail = Array.isArray(data?.detail)
-    ? data.detail.map((d) => d.msg).join(", ")
-    : data?.detail;
+  const detail = Array.isArray(raw)
+    ? raw
+        .map((d) => String(d?.msg || "").replace(/^Value error,\s*/i, ""))
+        .filter(Boolean)
+        .join(". ")
+    : typeof raw === "string"
+      ? raw
+      : "";
 
   return detail || fallback;
 }
@@ -298,6 +310,15 @@ export default function AiPlanner() {
       return;
     }
 
+    if (
+      replace &&
+      !window.confirm(
+        "Pehle se maujood saare stops hat jayenge aur sirf ye plan lagega. Jaari rakhein?"
+      )
+    ) {
+      return;
+    }
+
     setError("");
     setApplying(true);
 
@@ -316,9 +337,9 @@ export default function AiPlanner() {
               lat: stop.lat,
               lon: stop.lon,
               category: stop.category || "",
-              visitMinutes: Number(stop.visitMinutes || 0),
+              visitMinutes: clampNumber(stop.visitMinutes, 0, 1440, true),
               startTime: stop.startTime || "",
-              cost: Number(stop.cost || 0),
+              cost: clampNumber(stop.cost, 0, 1_000_000_000),
               costType: stop.costType || "other",
               notes: stop.notes || "",
             })),
