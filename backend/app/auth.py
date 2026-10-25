@@ -30,6 +30,19 @@ def create_token(user_id: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 
+def _token_older_than_password_change(payload: dict, user: dict) -> bool:
+    changed = user.get("passwordChangedAt")
+    if not isinstance(changed, datetime):
+        return False
+    if changed.tzinfo is None:
+        changed = changed.replace(tzinfo=timezone.utc)
+    try:
+        issued_at = int(payload.get("iat", 0))
+    except (TypeError, ValueError):
+        issued_at = 0
+    return issued_at < int(changed.timestamp())
+
+
 async def get_current_user(
     creds: HTTPAuthorizationCredentials | None = Depends(bearer),
 ) -> dict:
@@ -49,5 +62,10 @@ async def get_current_user(
     user = await db.users.find_one({"_id": oid})
     if not user:
         raise HTTPException(status_code=401, detail="User nahi mila")
+    if _token_older_than_password_change(payload, user):
+        raise HTTPException(
+            status_code=401,
+            detail="Password badal gaya hai, dobara login karein",
+        )
     user["id"] = str(user.pop("_id"))
     return user

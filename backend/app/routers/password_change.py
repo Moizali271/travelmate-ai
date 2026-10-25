@@ -12,9 +12,14 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 MAX_ATTEMPTS = 5
 WINDOW_SECONDS = 900  # 15 minute
+MAX_TRACKED_KEYS = 5000
+MAX_PASSWORD_BYTES = 72  # bcrypt ki limit bytes mein hai
 
 # "email|ip" -> ghalat koshishon ka waqt
 _failed: dict = {}
+
+# Email maujood na ho tab bhi bcrypt chale, taake jawab ka waqt ek jaisa rahe
+DUMMY_HASH = bcrypt.hashpw(b"not-a-real-password", bcrypt.gensalt()).decode()
 
 
 class PublicChangePasswordIn(BaseModel):
@@ -31,8 +36,39 @@ def attempt_key(email: str, request: Request) -> str:
 def recent_failures(key: str) -> list:
     now = time.time()
     attempts = [t for t in _failed.get(key, []) if now - t < WINDOW_SECONDS]
-    _failed[key] = attempts
+    if attempts:
+        _failed[key] = attempts
+    else:
+        _failed.pop(key, None)
     return attempts
+
+
+def record_failure(key: str) -> None:
+    if len(_failed) >= MAX_TRACKED_KEYS:
+        now = time.time()
+        for old_key in list(_failed):
+            fresh = [t for t in _failed[old_key] if now - t < WINDOW_SECONDS]
+            if fresh:
+                _failed[old_key] = fresh
+            else:
+                del _failed[old_key]
+        # phir bhi bhara ho to sabse purani entry hata do
+        while len(_failed) >= MAX_TRACKED_KEYS:
+            _failed.pop(next(iter(_failed)))
+    _failed.setdefault(key, []).append(time.time())
+
+
+def too_long(password: str) -> bool:
+    return len(password.encode("utf-8")) > MAX_PASSWORD_BYTES
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    if too_long(plain):
+        return False
+    try:
+        return bcrypt.checkpw(plain.encode(), hashed.encode())
+    except ValueError:
+        return False
 
 
 @router.post("/change-password-public")
@@ -46,25 +82,23 @@ async def change_password_public(body: PublicChangePasswordIn, request: Request)
             detail="Bohat zyada ghalat koshishen, 15 minute baad dobara try karein",
         )
 
+    if too_long(body.newPassword):
+        raise HTTPException(status_code=400, detail="Naya password bohat lamba hai")
+
     user = await db.users.find_one({"email": email})
 
     if user and not user.get("password_hash"):
+        record_failure(key)
         raise HTTPException(
             status_code=400,
             detail="Is email ke liye Google se login karein, password yahan change nahi hota",
         )
 
-    ok = False
-    if user:
-        try:
-            ok = bcrypt.checkpw(
-                body.currentPassword.encode(), user["password_hash"].encode()
-            )
-        except ValueError:
-            ok = False
+    stored_hash = user["password_hash"] if user else DUMMY_HASH
+    ok = verify_password(body.currentPassword, stored_hash) and bool(user)
 
     if not ok:
-        _failed.setdefault(key, []).append(time.time())
+        record_failure(key)
         await log_activity(None, "password_change_failed", {"email": email})
         raise HTTPException(
             status_code=401, detail="Email ya purana password ghalat hai"
@@ -75,9 +109,6 @@ async def change_password_public(body: PublicChangePasswordIn, request: Request)
             status_code=400,
             detail="Naya password purane se alag hona chahiye",
         )
-
-    if len(body.newPassword.encode()) > 72:
-        raise HTTPException(status_code=400, detail="Naya password bohat lamba hai")
 
     hashed = bcrypt.hashpw(body.newPassword.encode(), bcrypt.gensalt()).decode()
     await db.users.update_one(
