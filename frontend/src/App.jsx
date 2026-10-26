@@ -10,6 +10,7 @@ import Hotels from "./pages/Hotels";
 import MapPage from "./pages/MapPage";
 import Expenses from "./pages/Expenses";
 import Bookings from "./pages/Bookings";
+import Account from "./pages/Account";
 
 export default function App() {
   return (
@@ -27,6 +28,7 @@ export default function App() {
           <Route path="/bookings" element={<Bookings />} />
           <Route path="/map" element={<MapPage />} />
           <Route path="/expenses" element={<Expenses />} />
+          <Route path="/account" element={<Account />} />
         </Routes>
       </main>
     </BrowserRouter>

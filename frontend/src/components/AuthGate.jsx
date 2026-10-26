@@ -1,16 +1,36 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { GoogleLogin } from "@react-oauth/google";
 import { useAuth } from "../context/AuthContext";
 import ChangePasswordForm from "./ChangePasswordForm";
 
+const EXPIRED_KEY = "sessionExpiredMessage";
+
+function readExpiredMessage() {
+  try {
+    return sessionStorage.getItem(EXPIRED_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
 export default function AuthGate({ children }) {
-  const { user, loading, loginWithGoogle, login, register, logout } = useAuth();
+  const { user, loading, loginWithGoogle, login, register } = useAuth();
   const [mode, setMode] = useState("login");
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [notice] = useState(readExpiredMessage);
+
+  // Message ek baar dikhane ke baad hata do
+  useEffect(() => {
+    try {
+      sessionStorage.removeItem(EXPIRED_KEY);
+    } catch {
+      // storage band ho to koi baat nahi
+    }
+  }, []);
 
   if (loading) return <p className="p-10 text-gray-500">Loading...</p>;
 
@@ -55,6 +75,12 @@ export default function AuthGate({ children }) {
         <p className="text-gray-600">
           {mode === "login" ? "Apne account mein login karein" : "Naya account banayein"}
         </p>
+
+        {notice && (
+          <p className="w-full max-w-sm rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800">
+            {notice}
+          </p>
+        )}
 
         <form
           onSubmit={handleSubmit}
@@ -140,23 +166,5 @@ export default function AuthGate({ children }) {
     );
   }
 
-  return (
-    <>
-      <div className="flex items-center justify-end gap-3 bg-gray-100 px-4 py-2 text-sm">
-        {user.picture && (
-          <img
-            src={user.picture}
-            alt=""
-            referrerPolicy="no-referrer"
-            className="h-6 w-6 rounded-full"
-          />
-        )}
-        <span>{user.name}</span>
-        <button onClick={logout} className="rounded bg-gray-300 px-2 py-1">
-          Logout
-        </button>
-      </div>
-      {children}
-    </>
-  );
+  return <>{children}</>;
 }

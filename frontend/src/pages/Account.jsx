@@ -1,17 +1,9 @@
-import { useEffect, useState } from "react";
-
-const API_URL =
-  import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
-
-function getToken() {
-  return (
-    localStorage.getItem("token") ||
-    localStorage.getItem("access_token")
-  );
-}
+import { useState } from "react";
+import { authFetch } from "../services/authFetch";
+import { useAuth } from "../context/AuthContext";
 
 export default function Account() {
-  const [profile, setProfile] = useState(null);
+  const { user } = useAuth();
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -19,29 +11,6 @@ export default function Account() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
-
-  // Naam aur email dikhane ke liye
-  useEffect(() => {
-    let active = true;
-
-    async function loadProfile() {
-      try {
-        const res = await fetch(`${API_URL}/api/auth/me`, {
-          headers: { Authorization: `Bearer ${getToken()}` },
-        });
-        if (!res.ok) return;
-        const data = await res.json();
-        if (active) setProfile(data);
-      } catch {
-        if (active) setProfile(null);
-      }
-    }
-
-    loadProfile();
-    return () => {
-      active = false;
-    };
-  }, []);
 
   async function handleSubmit(e) {
     e.preventDefault();
@@ -59,12 +28,9 @@ export default function Account() {
 
     setBusy(true);
     try {
-      const res = await fetch(`${API_URL}/api/auth/change-password`, {
+      const res = await authFetch("/api/auth/change-password", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${getToken()}`,
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           currentPassword: current,
           newPassword: next,
@@ -94,19 +60,24 @@ export default function Account() {
     "w-full rounded-lg border border-gray-300 px-3 py-2 focus:border-[#D4AF37] focus:outline-none";
 
   return (
-    <div className="min-h-screen bg-white p-6">
-      <div className="rounded-2xl border border-[#D4AF37] bg-[#3B0718] p-8 text-white">
+    <div className="space-y-6 pb-10">
+      <div className="rounded-2xl border border-[#D4AF37] bg-[#3B0718] p-6 text-white sm:p-8">
         <h1 className="text-3xl font-bold text-[#D4AF37]">My Account</h1>
         <p className="mt-3 text-gray-200">
-          {profile ? `${profile.name} · ${profile.email}` : "Loading..."}
+          {user?.name} · {user?.email}
         </p>
+        {user?.role === "admin" && (
+          <span className="mt-3 inline-block rounded-full bg-[#D4AF37] px-3 py-1 text-xs font-bold text-[#3B0718]">
+            ADMIN
+          </span>
+        )}
       </div>
 
       <form
         onSubmit={handleSubmit}
-        className="mt-6 max-w-lg rounded-2xl border border-[#D4AF37]/60 p-6"
+        className="max-w-lg rounded-2xl border border-[#D4AF37]/60 p-5 sm:p-6"
       >
-        <h2 className="text-lg font-bold text-[#3B0718]">Change Password</h2>
+        <h2 className="text-lg font-bold text-[#3B0718]">Password badlein</h2>
 
         <div className="mt-4 space-y-3">
           <input
@@ -115,6 +86,7 @@ export default function Account() {
             onChange={(e) => setCurrent(e.target.value)}
             placeholder="Purana password"
             className={inputCls}
+            autoComplete="current-password"
             required
           />
           <input
@@ -123,6 +95,7 @@ export default function Account() {
             onChange={(e) => setNext(e.target.value)}
             placeholder="Naya password (kam az kam 6 characters)"
             className={inputCls}
+            autoComplete="new-password"
             required
           />
           <input
@@ -131,6 +104,7 @@ export default function Account() {
             onChange={(e) => setConfirm(e.target.value)}
             placeholder="Naya password dobara likhein"
             className={inputCls}
+            autoComplete="new-password"
             required
           />
         </div>
@@ -162,6 +136,12 @@ export default function Account() {
         >
           {busy ? "Saving..." : "Change Password"}
         </button>
+
+        <p className="mt-3 text-xs text-gray-500">
+          Google se login karne walon ka password yahan change nahi hota.
+          Password badalne ke baad purane tokens band ho jate hain, isliye
+          doosri jagah dobara login karna pad sakta hai.
+        </p>
       </form>
     </div>
   );
